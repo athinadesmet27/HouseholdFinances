@@ -8,6 +8,8 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<!-- Your private settings live in config.js (kept separate so app updates never touch your keys). -->
+<script src="config.js"></script>
 <style>
   html, body { margin: 0; padding: 0; }
   body { background: #f3efe6; }
@@ -20,16 +22,27 @@
 const { useState, useEffect, useCallback, useRef } = React;
 
 /* ============================================================
-   SUPABASE SETUP  —  fill in these two values (see instructions)
+   CONFIG — read from config.js (window.LEDGER_CONFIG).
+   You should never need to edit this file's settings; edit config.js.
    ============================================================ */
-const SUPABASE_URL = "https://yjlljuwierbcblifgxxt.supabase.co";
-const SUPABASE_ANON_KEY = "sb_publishable_aOe5OvSpnK0l_Dpdz0SWvQ_0fF4kf8D";
+const CFG = (typeof window !== "undefined" && window.LEDGER_CONFIG) || {};
+const SUPABASE_URL = CFG.supabaseUrl || "";
+const SUPABASE_ANON_KEY = CFG.supabaseKey || "";
+const SUPABASE_TABLE = CFG.table || "ledger";
 
-// Everyone sharing this household uses the SAME id. Keep the default
-// or change it to any string you both use — it just must match.
-const HOUSEHOLD_ID = "athina-grant";
-const SUPABASE_TABLE = "ledger";
-const LOCAL_KEY = "household-ledger-cache-v1";
+// Household ID: from ?home= in the URL, else config default, else a safe fallback.
+// This lets one deployed app serve many separate households later — each gets
+// its own link like  .../index.html?home=SOME-ID  and its own private data row.
+function resolveHouseholdId() {
+  try {
+    const u = new URL(window.location.href);
+    const fromUrl = u.searchParams.get("home");
+    if (fromUrl) return fromUrl.trim().toLowerCase();
+  } catch {}
+  return (CFG.defaultHousehold || "default-home").trim().toLowerCase();
+}
+const HOUSEHOLD_ID = resolveHouseholdId();
+const LOCAL_KEY = "household-ledger-cache:" + HOUSEHOLD_ID;
 
 const sb = (SUPABASE_URL.startsWith("http") && window.supabase)
   ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
@@ -382,21 +395,36 @@ function BarPair({ income, expenses }) {
 }
 
 // ---- Editable line-item table ----
-function ItemTable({ items, onChange, onAdd, onRemove, valueLabel = "Amount" }) {
+function ItemTable({ items, onChange, onAdd, onRemove, onReorder, valueLabel = "Amount" }) {
+  const drag = useDragReorder(items, onReorder || (() => {}));
+  const canDrag = !!onReorder;
   return (
     <div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 140px 40px", padding: "0 8px 8px", fontSize: 12, textTransform: "uppercase", letterSpacing: 1, color: C.muted, borderBottom: `1px solid ${C.line}` }}>
-        <span>Item</span><span style={{ textAlign: "right" }}>{valueLabel}</span><span />
+      <div style={{ display: "grid", gridTemplateColumns: canDrag ? "24px 1fr 140px 40px" : "1fr 140px 40px", padding: "0 8px 8px", fontSize: 12, textTransform: "uppercase", letterSpacing: 1, color: C.muted, borderBottom: `1px solid ${C.line}` }}>
+        {canDrag && <span />}<span>Item</span><span style={{ textAlign: "right" }}>{valueLabel}</span><span />
       </div>
-      {items.map((it) => (
-        <div key={it.id} className="row-in" style={{ display: "grid", gridTemplateColumns: "1fr 140px 40px", alignItems: "center", borderBottom: `1px solid ${C.line}` }}>
-          <input className="cell namecell" value={it.name} onChange={(e) => onChange(it.id, "name", e.target.value)} />
-          <input className="cell tnum" type="number" value={it.value} onChange={(e) => onChange(it.id, "value", e.target.value)} />
-          <button onClick={() => onRemove(it.id)} style={{ background: "none", border: "none", color: C.muted, display: "grid", placeItems: "center" }} title="Remove">
-            <Ic d="M3 6h18|M8 6V4h8v2|M19 6l-1 14H6L5 6|M10 11v6|M14 11v6" size={15} />
-          </button>
-        </div>
-      ))}
+      {items.map((it) => {
+        const isOver = drag.overId === it.id && drag.dragId !== it.id;
+        const isDragging = drag.dragId === it.id;
+        return (
+          <div key={it.id} data-rowid={it.id} className="row-in"
+            {...(canDrag ? drag.dragProps(it.id) : {})}
+            style={{ display: "grid", gridTemplateColumns: canDrag ? "24px 1fr 140px 40px" : "1fr 140px 40px", alignItems: "center",
+              borderBottom: `1px solid ${C.line}`, borderTop: isOver ? `2px solid ${C.brass}` : "2px solid transparent",
+              opacity: isDragging ? 0.4 : 1, background: isDragging ? C.paper : "transparent" }}>
+            {canDrag && (
+              <span {...drag.touchProps(it.id)} style={{ touchAction: "none" }}>
+                <DragHandle active={isDragging} />
+              </span>
+            )}
+            <input className="cell namecell" value={it.name} onChange={(e) => onChange(it.id, "name", e.target.value)} />
+            <input className="cell tnum" type="number" value={it.value} onChange={(e) => onChange(it.id, "value", e.target.value)} />
+            <button onClick={() => onRemove(it.id)} style={{ background: "none", border: "none", color: C.muted, display: "grid", placeItems: "center" }} title="Remove">
+              <Ic d="M3 6h18|M8 6V4h8v2|M19 6l-1 14H6L5 6|M10 11v6|M14 11v6" size={15} />
+            </button>
+          </div>
+        );
+      })}
       <button onClick={onAdd} style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 6, background: "none", border: `1px dashed ${C.moss}`, color: C.forest, padding: "8px 14px", borderRadius: 8, fontSize: 13 }}>
         <Ic d="M12 5v14|M5 12h14" size={14} /> Add row
       </button>
@@ -414,6 +442,54 @@ function useListEditor(data, persist, key) {
   return { change, add, remove };
 }
 
+// Reorder hook: returns drag state + handlers. Reorders `items` and calls onReorder(newArray).
+function useDragReorder(items, onReorder) {
+  const [dragId, setDragId] = React.useState(null);
+  const [overId, setOverId] = React.useState(null);
+  const touchData = React.useRef(null);
+
+  const reorder = (fromId, toId) => {
+    if (fromId === toId) return;
+    const from = items.findIndex((x) => x.id === fromId);
+    const to = items.findIndex((x) => x.id === toId);
+    if (from < 0 || to < 0) return;
+    const next = [...items];
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    onReorder(next);
+  };
+
+  // Desktop HTML5 drag
+  const dragProps = (id) => ({
+    draggable: true,
+    onDragStart: (e) => { setDragId(id); e.dataTransfer.effectAllowed = "move"; },
+    onDragOver: (e) => { e.preventDefault(); if (overId !== id) setOverId(id); },
+    onDrop: (e) => { e.preventDefault(); reorder(dragId, id); setDragId(null); setOverId(null); },
+    onDragEnd: () => { setDragId(null); setOverId(null); },
+  });
+
+  // Touch drag (mobile)
+  const touchProps = (id) => ({
+    onTouchStart: (e) => { touchData.current = { id }; setDragId(id); },
+    onTouchMove: (e) => {
+      const t = e.touches[0];
+      const el = document.elementFromPoint(t.clientX, t.clientY);
+      const row = el && el.closest("[data-rowid]");
+      if (row) { const rid = row.getAttribute("data-rowid"); if (rid !== overId) setOverId(rid); }
+    },
+    onTouchEnd: () => { if (touchData.current && overId) reorder(touchData.current.id, overId); touchData.current = null; setDragId(null); setOverId(null); },
+  });
+
+  return { dragId, overId, dragProps, touchProps };
+}
+
+// Drag handle icon (grip dots)
+function DragHandle({ active }) {
+  return (
+    <span style={{ cursor: "grab", color: active ? C.forest : C.line, fontSize: 14, lineHeight: 1, userSelect: "none", touchAction: "none", padding: "0 2px" }} title="Drag to reorder">⠿</span>
+  );
+}
+
 // ---- Net Worth tab ----
 function Ledger({ data, persist }) {
   const toggleLiquid = (id) => {
@@ -425,35 +501,48 @@ function Ledger({ data, persist }) {
     persist({ ...data, assets: [...data.assets, { id: "a" + Date.now(), name: "New asset", value: 0, liquid: false }] });
   const removeAsset = (id) =>
     persist({ ...data, assets: data.assets.filter((a) => a.id !== id) });
+  const reorderAssets = (next) => persist({ ...data, assets: next });
+  const reorderLiabilities = (next) => persist({ ...data, liabilities: next });
   const l = useListEditor(data, persist, "liabilities");
+  const drag = useDragReorder(data.assets, reorderAssets);
 
   const liquidTotal = sum(data.assets.filter((a) => a.liquid));
 
   return (
     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 20 }}>
       <Card title="Assets" accent={C.green}>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 120px 48px 34px", padding: "0 4px 8px",
+        <div style={{ display: "grid", gridTemplateColumns: "24px 1fr 120px 48px 34px", padding: "0 4px 8px",
           fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: C.muted, borderBottom: `1px solid ${C.line}` }}>
-          <span>Item</span><span style={{ textAlign: "right" }}>Value</span>
+          <span /><span>Item</span><span style={{ textAlign: "right" }}>Value</span>
           <span style={{ textAlign: "center" }} title="Mark as liquid / easily accessible">💧</span>
           <span />
         </div>
-        {data.assets.map((a) => (
-          <div key={a.id} className="row-in"
-            style={{ display: "grid", gridTemplateColumns: "1fr 120px 48px 34px", alignItems: "center", borderBottom: `1px solid ${C.line}` }}>
-            <input className="cell namecell" value={a.name} onChange={(e) => changeAsset(a.id, "name", e.target.value)} />
-            <input className="cell tnum" type="number" value={a.value} onChange={(e) => changeAsset(a.id, "value", e.target.value)} />
-            <button onClick={() => toggleLiquid(a.id)} title={a.liquid ? "Liquid — click to remove" : "Mark as liquid/accessible"}
-              style={{ background: "none", border: "none", display: "grid", placeItems: "center", fontSize: 16,
-                opacity: a.liquid ? 1 : 0.25, cursor: "pointer", transition: "opacity .15s" }}>
-              💧
-            </button>
-            <button onClick={() => removeAsset(a.id)}
-              style={{ background: "none", border: "none", color: C.muted, display: "grid", placeItems: "center" }}>
-              <Ic d="M3 6h18|M8 6V4h8v2|M19 6l-1 14H6L5 6|M10 11v6|M14 11v6" size={15} />
-            </button>
-          </div>
-        ))}
+        {data.assets.map((a) => {
+          const isOver = drag.overId === a.id && drag.dragId !== a.id;
+          const isDragging = drag.dragId === a.id;
+          return (
+            <div key={a.id} data-rowid={a.id} className="row-in"
+              {...drag.dragProps(a.id)}
+              style={{ display: "grid", gridTemplateColumns: "24px 1fr 120px 48px 34px", alignItems: "center",
+                borderBottom: `1px solid ${C.line}`, borderTop: isOver ? `2px solid ${C.brass}` : "2px solid transparent",
+                opacity: isDragging ? 0.4 : 1, background: isDragging ? C.paper : "transparent" }}>
+              <span {...drag.touchProps(a.id)} style={{ touchAction: "none" }}>
+                <DragHandle active={isDragging} />
+              </span>
+              <input className="cell namecell" value={a.name} onChange={(e) => changeAsset(a.id, "name", e.target.value)} />
+              <input className="cell tnum" type="number" value={a.value} onChange={(e) => changeAsset(a.id, "value", e.target.value)} />
+              <button onClick={() => toggleLiquid(a.id)} title={a.liquid ? "Liquid — click to remove" : "Mark as liquid/accessible"}
+                style={{ background: "none", border: "none", display: "grid", placeItems: "center", fontSize: 16,
+                  opacity: a.liquid ? 1 : 0.25, cursor: "pointer", transition: "opacity .15s" }}>
+                💧
+              </button>
+              <button onClick={() => removeAsset(a.id)}
+                style={{ background: "none", border: "none", color: C.muted, display: "grid", placeItems: "center" }}>
+                <Ic d="M3 6h18|M8 6V4h8v2|M19 6l-1 14H6L5 6|M10 11v6|M14 11v6" size={15} />
+              </button>
+            </div>
+          );
+        })}
         <button onClick={addAsset}
           style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 6, background: "none",
             border: `1px dashed ${C.moss}`, color: C.forest, padding: "8px 14px", borderRadius: 8, fontSize: 13 }}>
@@ -466,11 +555,11 @@ function Ledger({ data, persist }) {
           <span className="tnum" style={{ fontWeight: 600, color: C.moss }}>{fmt(liquidTotal)}</span>
         </div>
         <p style={{ fontSize: 12, color: C.muted, marginTop: 8, lineHeight: 1.5 }}>
-          Tap 💧 to mark accounts that are easily accessible — these can be linked to savings goals.
+          Tap 💧 to mark accounts that are easily accessible — these can be linked to savings goals. Drag ⠿ to reorder.
         </p>
       </Card>
       <Card title="Liabilities" accent={C.red}>
-        <ItemTable items={data.liabilities} onChange={l.change} onAdd={l.add} onRemove={l.remove} valueLabel="Balance" />
+        <ItemTable items={data.liabilities} onChange={l.change} onAdd={l.add} onRemove={l.remove} onReorder={reorderLiabilities} valueLabel="Balance" />
         <Total label="Total liabilities" value={sum(data.liabilities)} color={C.red} />
       </Card>
     </div>
