@@ -1,0 +1,1073 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>The Household Ledger</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; }
+  body { background: #f3efe6; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, useRef } = React;
+
+/* ============================================================
+   SUPABASE SETUP  —  fill in these two values (see instructions)
+   ============================================================ */
+const SUPABASE_URL = "https://yjlljuwierbcblifgxxt.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_aOe5OvSpnK0l_Dpdz0SWvQ_0fF4kf8D";
+
+// Everyone sharing this household uses the SAME id. Keep the default
+// or change it to any string you both use — it just must match.
+const HOUSEHOLD_ID = "athina-grant";
+const SUPABASE_TABLE = "ledger";
+const LOCAL_KEY = "household-ledger-cache-v1";
+
+const sb = (SUPABASE_URL.startsWith("http") && window.supabase)
+  ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+  : null;
+
+/* Local cache so the app still works offline / before setup */
+function loadLocal() {
+  try { const r = localStorage.getItem(LOCAL_KEY); return r ? migrate(JSON.parse(r)) : null; }
+  catch { return null; }
+}
+function saveLocal(d) {
+  try { localStorage.setItem(LOCAL_KEY, JSON.stringify(d)); } catch {}
+}
+
+/* Ensure older saved data has all newer fields */
+function migrate(d) {
+  const base = JSON.parse(JSON.stringify(DEFAULT_DATA));
+  const out = { ...base, ...d };
+  out.assets = (d.assets || base.assets).map((a) => ({ liquid: false, ...a }));
+  out.liabilities = d.liabilities || base.liabilities;
+  out.income = d.income || base.income;
+  out.expenses = d.expenses || base.expenses;
+  out.history = d.history || [];
+  out.goals = (d.goals || base.goals).map((g, i) => ({
+    isEmergencyFund: false, expenseMonths: 3, priority: i, splitWeight: 100,
+    linkedAssets: [], saved: 0, target: 0, ...g,
+  }));
+  return out;
+}
+
+/* Inline icon component (replaces lucide-react). Paths separated by "|". */
+function Ic({ d, size = 16 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+      style={{ flexShrink: 0, verticalAlign: "middle" }}>
+      {String(d).split("|").map((seg, i) => <path key={i} d={seg} />)}
+    </svg>
+  );
+}
+
+
+
+
+// ---- Storage helpers (shared so both partners see the same data) ----
+
+
+const DEFAULT_DATA = {
+  assets: [
+    { id: "a1", name: "Checking", value: 12000, liquid: true },
+    { id: "a2", name: "Savings", value: 38000, liquid: true },
+    { id: "a3", name: "401(k) / Retirement", value: 145000, liquid: false },
+    { id: "a4", name: "Home equity", value: 210000, liquid: false },
+  ],
+  liabilities: [
+    { id: "l1", name: "Mortgage", value: 320000 },
+    { id: "l2", name: "Car loan", value: 14000 },
+  ],
+  income: [
+    { id: "i1", name: "Salary — primary", value: 8500 },
+    { id: "i2", name: "Salary — partner", value: 6200 },
+  ],
+  expenses: [
+    { id: "e1", name: "Mortgage + utilities", value: 3100 },
+    { id: "e2", name: "Childcare", value: 1400 },
+    { id: "e3", name: "Food + household", value: 1500 },
+    { id: "e4", name: "Everything else", value: 2200 },
+  ],
+  goals: [
+    { id: "g1", name: "Emergency fund", target: 50000, saved: 38000, linkedAssets: [], isEmergencyFund: true, expenseMonths: 3, priority: 0, splitWeight: 100 },
+    { id: "g2", name: "Family trip", target: 8000, saved: 2400, linkedAssets: [], isEmergencyFund: false, expenseMonths: 3, priority: 1, splitWeight: 100 },
+  ],
+  history: [],
+};
+
+const fmt = (n) =>
+  n.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+
+const sum = (arr) => arr.reduce((t, x) => t + (Number(x.value) || 0), 0);
+
+// ---- Palette: deep forest + brass, warm-autumn leaning, ledger feel ----
+const C = {
+  ink: "#1f2420",
+  forest: "#2f4438",
+  moss: "#4a6451",
+  brass: "#b08a3e",
+  brassLight: "#d9b873",
+  paper: "#f3efe6",
+  card: "#fbf9f3",
+  line: "#e0d9c8",
+  red: "#9e4634",
+  green: "#3f6b4a",
+  muted: "#6b6357",
+};
+
+function FinanceTracker() {
+  const [data, setData] = useState(null);
+  const [tab, setTab] = useState("overview");
+  const [saving, setSaving] = useState(false);
+
+  const [status, setStatus] = useState("connecting"); // connecting | online | local | error
+  const saveTimer = useRef(null);
+  const skipNextRealtime = useRef(false);
+
+  // Initial load from Supabase (falls back to local cache, then defaults)
+  useEffect(() => {
+    (async () => {
+      const cached = loadLocal();
+      if (!sb) { setData(cached || DEFAULT_DATA); setStatus("local"); return; }
+      try {
+        const { data: row, error } = await sb
+          .from(SUPABASE_TABLE).select("payload").eq("id", HOUSEHOLD_ID).maybeSingle();
+        if (error) throw error;
+        if (row && row.payload) {
+          setData(migrate(row.payload));
+          setStatus("online");
+        } else {
+          // First run: seed the row
+          const seed = cached || DEFAULT_DATA;
+          await sb.from(SUPABASE_TABLE).upsert({ id: HOUSEHOLD_ID, payload: seed });
+          setData(seed);
+          setStatus("online");
+        }
+      } catch (e) {
+        console.error("Supabase load failed:", e);
+        setData(cached || DEFAULT_DATA);
+        setStatus("error");
+      }
+    })();
+  }, []);
+
+  // Realtime subscription: apply changes made by the other person
+  useEffect(() => {
+    if (!sb) return;
+    const channel = sb
+      .channel("household-changes")
+      .on("postgres_changes",
+        { event: "*", schema: "public", table: SUPABASE_TABLE, filter: `id=eq.${HOUSEHOLD_ID}` },
+        (payload) => {
+          if (skipNextRealtime.current) { skipNextRealtime.current = false; return; }
+          if (payload.new && payload.new.payload) {
+            setData(migrate(payload.new.payload));
+          }
+        })
+      .subscribe();
+    return () => { sb.removeChannel(channel); };
+  }, []);
+
+  const persist = useCallback((next) => {
+    setData(next);
+    saveLocal(next);
+    if (!sb) { setStatus("local"); return; }
+    setSaving(true);
+    clearTimeout(saveTimer.current);
+    // debounce writes so rapid typing doesn't hammer the DB
+    saveTimer.current = setTimeout(async () => {
+      try {
+        skipNextRealtime.current = true;
+        const { error } = await sb.from(SUPABASE_TABLE)
+          .upsert({ id: HOUSEHOLD_ID, payload: next, updated_at: new Date().toISOString() });
+        if (error) throw error;
+        setStatus("online");
+      } catch (e) {
+        console.error("Save failed:", e);
+        setStatus("error");
+      } finally {
+        setSaving(false);
+      }
+    }, 600);
+  }, []);
+
+  const reload = useCallback(async () => {
+    if (!sb) { const c = loadLocal(); if (c) setData(c); return; }
+    try {
+      const { data: row } = await sb.from(SUPABASE_TABLE).select("payload").eq("id", HOUSEHOLD_ID).maybeSingle();
+      if (row && row.payload) { setData(migrate(row.payload)); setStatus("online"); }
+    } catch (e) { console.error(e); }
+  }, []);
+
+  if (!data) {
+    return (
+      <div style={{ minHeight: "100vh", background: C.paper, display: "grid", placeItems: "center", fontFamily: "Georgia, serif", color: C.muted }}>
+        Loading your ledger…
+      </div>
+    );
+  }
+
+  const totalAssets = sum(data.assets);
+  const totalLiabilities = sum(data.liabilities);
+  const netWorth = totalAssets - totalLiabilities;
+  const monthlyIncome = sum(data.income);
+  const monthlyExpenses = sum(data.expenses);
+  const monthlyNet = monthlyIncome - monthlyExpenses;
+
+  const tabs = [
+    { id: "overview", label: "Overview", icon: "M21 12V7H5a2 2 0 0 1 0-4h14v4M21 12v5H5a2 2 0 0 0 0 4h14v-4" },
+    { id: "networth", label: "Net Worth", icon: "M22 7l-8.5 8.5-5-5L2 17|M16 7h6v6" },
+    { id: "history", label: "History", icon: "M3 3v5h5|M3.05 13A9 9 0 1 0 6 5.3L3 8|M12 7v5l4 2" },
+    { id: "cashflow", label: "Cash Flow", icon: "M3 3v18h18|M18 9l-5 5-4-4-3 3" },
+    { id: "goals", label: "Goals", icon: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z|M12 18a6 6 0 1 0 0-12 6 6 0 0 0 0 12z|M12 14a2 2 0 1 0 0-4 2 2 0 0 0 0 4z" },
+    { id: "scenario", label: "Scenarios", icon: "M19 8a7 7 0 0 0-14 0c0 2 1 4 3 5v3h8v-3c2-1 3-3 3-5z|M9 17v2a3 3 0 0 0 6 0v-2" },
+  ];
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.paper, fontFamily: "'Helvetica Neue', Arial, sans-serif", color: C.ink }}>
+      <style>{`
+        * { box-sizing: border-box; }
+        .serif { font-family: Georgia, 'Times New Roman', serif; }
+        .tnum { font-variant-numeric: tabular-nums; }
+        .row-in { transition: background .15s; }
+        .row-in:hover { background: ${C.paper}; }
+        input.cell { width: 100%; border: none; background: transparent; font: inherit; color: ${C.ink}; text-align: right; padding: 6px 8px; border-radius: 6px; }
+        input.cell:focus { outline: 2px solid ${C.brassLight}; background: #fff; }
+        input.namecell { text-align: left; }
+        button { cursor: pointer; font-family: inherit; }
+        .tabbtn:focus-visible, button:focus-visible { outline: 2px solid ${C.brass}; outline-offset: 2px; }
+        @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+      `}</style>
+
+      {/* Header */}
+      <header style={{ background: C.forest, color: C.paper, padding: "22px 24px" }}>
+        <div style={{ maxWidth: 1000, margin: "0 auto", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
+          <div>
+            <div className="serif" style={{ fontSize: 26, letterSpacing: 0.5 }}>The Household Ledger</div>
+            <div style={{ fontSize: 13, color: C.brassLight, marginTop: 2 }}>
+              {status === "online" ? "● Live — synced with Grant"
+                : status === "connecting" ? "○ Connecting…"
+                : status === "local" ? "○ Local only (check setup)"
+                : "● Sync error — changes saved locally"}
+            </div>
+          </div>
+          <button onClick={reload} title="Refresh shared data"
+            style={{ display: "flex", alignItems: "center", gap: 6, background: "transparent", border: `1px solid ${C.moss}`, color: C.paper, padding: "8px 14px", borderRadius: 8, fontSize: 13 }}>
+            <Ic d="M23 4v6h-6M1 20v-6h6|M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" size={14} /> {saving ? "Saving…" : "Sync"}
+          </button>
+        </div>
+      </header>
+
+      {/* Net worth banner */}
+      <div style={{ background: C.ink, color: C.paper, padding: "18px 24px" }}>
+        <div style={{ maxWidth: 1000, margin: "0 auto", display: "flex", gap: 36, flexWrap: "wrap", alignItems: "baseline" }}>
+          <div>
+            <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 1.5, color: C.brassLight }}>Net Worth</div>
+            <div className="serif tnum" style={{ fontSize: 38, fontWeight: 700 }}>{fmt(netWorth)}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 1.5, color: C.brassLight }}>Monthly Surplus</div>
+            <div className="serif tnum" style={{ fontSize: 28, color: monthlyNet >= 0 ? C.brassLight : "#e09b8a", display: "flex", alignItems: "center", gap: 6 }}>
+              {monthlyNet >= 0 ? <Ic d="M7 17l9.2-9.2M17 17V7H7" size={22} /> : <Ic d="M7 7l9.2 9.2M17 7v10H7" size={22} />}{fmt(monthlyNet)}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <nav style={{ background: C.card, borderBottom: `1px solid ${C.line}`, position: "sticky", top: 0, zIndex: 5 }}>
+        <div style={{ maxWidth: 1000, margin: "0 auto", display: "flex", overflowX: "auto" }}>
+          {tabs.map((t) => {
+            const iconPath = t.icon;
+            const active = tab === t.id;
+            return (
+              <button key={t.id} className="tabbtn" onClick={() => setTab(t.id)}
+                style={{ display: "flex", alignItems: "center", gap: 7, padding: "14px 18px", border: "none", background: "transparent", whiteSpace: "nowrap",
+                  color: active ? C.forest : C.muted, fontWeight: active ? 700 : 500, fontSize: 14,
+                  borderBottom: active ? `3px solid ${C.brass}` : "3px solid transparent" }}>
+                <Ic d={iconPath} size={16} /> {t.label}
+              </button>
+            );
+          })}
+        </div>
+      </nav>
+
+      <main style={{ maxWidth: 1000, margin: "0 auto", padding: "28px 24px 60px" }}>
+        {tab === "overview" && <Overview {...{ totalAssets, totalLiabilities, netWorth, monthlyIncome, monthlyExpenses, monthlyNet, data }} />}
+        {tab === "networth" && <Ledger {...{ data, persist }} />}
+        {tab === "history" && <NetWorthHistory {...{ data, persist, netWorth, totalAssets, totalLiabilities }} />}
+        {tab === "cashflow" && <CashFlow {...{ data, persist, monthlyIncome, monthlyExpenses, monthlyNet }} />}
+        {tab === "goals" && <Goals {...{ data, persist, monthlyNet, monthlyExpenses }} />}
+        {tab === "scenario" && <Scenario {...{ netWorth, monthlyNet, totalAssets }} />}
+      </main>
+    </div>
+  );
+}
+
+// ---- Reusable card ----
+function Card({ title, children, accent }) {
+  return (
+    <section style={{ background: C.card, border: `1px solid ${C.line}`, borderRadius: 12, overflow: "hidden", marginBottom: 20 }}>
+      {title && (
+        <div style={{ padding: "14px 18px", borderBottom: `1px solid ${C.line}`, borderLeft: `4px solid ${accent || C.brass}` }}>
+          <h2 className="serif" style={{ margin: 0, fontSize: 18, color: C.ink }}>{title}</h2>
+        </div>
+      )}
+      <div style={{ padding: 18 }}>{children}</div>
+    </section>
+  );
+}
+
+function Stat({ label, value, color }) {
+  return (
+    <div style={{ background: C.card, border: `1px solid ${C.line}`, borderRadius: 12, padding: 18, flex: "1 1 200px" }}>
+      <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 1, color: C.muted }}>{label}</div>
+      <div className="serif tnum" style={{ fontSize: 26, fontWeight: 700, color: color || C.ink, marginTop: 6 }}>{value}</div>
+    </div>
+  );
+}
+
+// ---- Overview ----
+function Overview({ totalAssets, totalLiabilities, netWorth, monthlyIncome, monthlyExpenses, monthlyNet, data }) {
+  const savingsRate = monthlyIncome > 0 ? Math.round((monthlyNet / monthlyIncome) * 100) : 0;
+  return (
+    <>
+      <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 20 }}>
+        <Stat label="Total Assets" value={fmt(totalAssets)} color={C.green} />
+        <Stat label="Total Liabilities" value={fmt(totalLiabilities)} color={C.red} />
+        <Stat label="Net Worth" value={fmt(netWorth)} color={C.forest} />
+        <Stat label="Savings Rate" value={`${savingsRate}%`} color={C.brass} />
+      </div>
+      <Card title="This Month at a Glance">
+        <BarPair income={monthlyIncome} expenses={monthlyExpenses} />
+        <p style={{ color: C.muted, fontSize: 14, marginTop: 16, lineHeight: 1.6 }}>
+          You're bringing in {fmt(monthlyIncome)} and spending {fmt(monthlyExpenses)}, leaving{" "}
+          <strong style={{ color: monthlyNet >= 0 ? C.green : C.red }}>{fmt(monthlyNet)}</strong> to put toward goals each month.
+          {data.goals.length > 0 && ` You're tracking ${data.goals.length} savings goal${data.goals.length > 1 ? "s" : ""}.`}
+        </p>
+      </Card>
+    </>
+  );
+}
+
+function BarPair({ income, expenses }) {
+  const max = Math.max(income, expenses, 1);
+  const Bar = ({ label, val, color }) => (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 4 }}>
+        <span style={{ color: C.muted }}>{label}</span>
+        <span className="tnum" style={{ fontWeight: 700 }}>{fmt(val)}</span>
+      </div>
+      <div style={{ height: 14, background: C.paper, borderRadius: 7, overflow: "hidden" }}>
+        <div style={{ width: `${(val / max) * 100}%`, height: "100%", background: color, borderRadius: 7 }} />
+      </div>
+    </div>
+  );
+  return (
+    <div>
+      <Bar label="Income" val={income} color={C.green} />
+      <Bar label="Expenses" val={expenses} color={C.red} />
+    </div>
+  );
+}
+
+// ---- Editable line-item table ----
+function ItemTable({ items, onChange, onAdd, onRemove, valueLabel = "Amount" }) {
+  return (
+    <div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 140px 40px", padding: "0 8px 8px", fontSize: 12, textTransform: "uppercase", letterSpacing: 1, color: C.muted, borderBottom: `1px solid ${C.line}` }}>
+        <span>Item</span><span style={{ textAlign: "right" }}>{valueLabel}</span><span />
+      </div>
+      {items.map((it) => (
+        <div key={it.id} className="row-in" style={{ display: "grid", gridTemplateColumns: "1fr 140px 40px", alignItems: "center", borderBottom: `1px solid ${C.line}` }}>
+          <input className="cell namecell" value={it.name} onChange={(e) => onChange(it.id, "name", e.target.value)} />
+          <input className="cell tnum" type="number" value={it.value} onChange={(e) => onChange(it.id, "value", e.target.value)} />
+          <button onClick={() => onRemove(it.id)} style={{ background: "none", border: "none", color: C.muted, display: "grid", placeItems: "center" }} title="Remove">
+            <Ic d="M3 6h18|M8 6V4h8v2|M19 6l-1 14H6L5 6|M10 11v6|M14 11v6" size={15} />
+          </button>
+        </div>
+      ))}
+      <button onClick={onAdd} style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 6, background: "none", border: `1px dashed ${C.moss}`, color: C.forest, padding: "8px 14px", borderRadius: 8, fontSize: 13 }}>
+        <Ic d="M12 5v14|M5 12h14" size={14} /> Add row
+      </button>
+    </div>
+  );
+}
+
+function useListEditor(data, persist, key) {
+  const change = (id, field, val) => {
+    const next = { ...data, [key]: data[key].map((x) => (x.id === id ? { ...x, [field]: field === "value" ? val : val } : x)) };
+    persist(next);
+  };
+  const add = () => persist({ ...data, [key]: [...data[key], { id: key + Date.now(), name: "New item", value: 0 }] });
+  const remove = (id) => persist({ ...data, [key]: data[key].filter((x) => x.id !== id) });
+  return { change, add, remove };
+}
+
+// ---- Net Worth tab ----
+function Ledger({ data, persist }) {
+  const toggleLiquid = (id) => {
+    persist({ ...data, assets: data.assets.map((a) => a.id === id ? { ...a, liquid: !a.liquid } : a) });
+  };
+  const changeAsset = (id, field, val) =>
+    persist({ ...data, assets: data.assets.map((a) => a.id === id ? { ...a, [field]: val } : a) });
+  const addAsset = () =>
+    persist({ ...data, assets: [...data.assets, { id: "a" + Date.now(), name: "New asset", value: 0, liquid: false }] });
+  const removeAsset = (id) =>
+    persist({ ...data, assets: data.assets.filter((a) => a.id !== id) });
+  const l = useListEditor(data, persist, "liabilities");
+
+  const liquidTotal = sum(data.assets.filter((a) => a.liquid));
+
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 20 }}>
+      <Card title="Assets" accent={C.green}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 120px 48px 34px", padding: "0 4px 8px",
+          fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: C.muted, borderBottom: `1px solid ${C.line}` }}>
+          <span>Item</span><span style={{ textAlign: "right" }}>Value</span>
+          <span style={{ textAlign: "center" }} title="Mark as liquid / easily accessible">💧</span>
+          <span />
+        </div>
+        {data.assets.map((a) => (
+          <div key={a.id} className="row-in"
+            style={{ display: "grid", gridTemplateColumns: "1fr 120px 48px 34px", alignItems: "center", borderBottom: `1px solid ${C.line}` }}>
+            <input className="cell namecell" value={a.name} onChange={(e) => changeAsset(a.id, "name", e.target.value)} />
+            <input className="cell tnum" type="number" value={a.value} onChange={(e) => changeAsset(a.id, "value", e.target.value)} />
+            <button onClick={() => toggleLiquid(a.id)} title={a.liquid ? "Liquid — click to remove" : "Mark as liquid/accessible"}
+              style={{ background: "none", border: "none", display: "grid", placeItems: "center", fontSize: 16,
+                opacity: a.liquid ? 1 : 0.25, cursor: "pointer", transition: "opacity .15s" }}>
+              💧
+            </button>
+            <button onClick={() => removeAsset(a.id)}
+              style={{ background: "none", border: "none", color: C.muted, display: "grid", placeItems: "center" }}>
+              <Ic d="M3 6h18|M8 6V4h8v2|M19 6l-1 14H6L5 6|M10 11v6|M14 11v6" size={15} />
+            </button>
+          </div>
+        ))}
+        <button onClick={addAsset}
+          style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 6, background: "none",
+            border: `1px dashed ${C.moss}`, color: C.forest, padding: "8px 14px", borderRadius: 8, fontSize: 13 }}>
+          <Ic d="M12 5v14|M5 12h14" size={14} /> Add row
+        </button>
+        <Total label="Total assets" value={sum(data.assets)} color={C.green} />
+        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8, paddingTop: 8,
+          borderTop: `1px dashed ${C.line}`, fontSize: 13, color: C.muted }}>
+          <span>💧 Liquid / accessible</span>
+          <span className="tnum" style={{ fontWeight: 600, color: C.moss }}>{fmt(liquidTotal)}</span>
+        </div>
+        <p style={{ fontSize: 12, color: C.muted, marginTop: 8, lineHeight: 1.5 }}>
+          Tap 💧 to mark accounts that are easily accessible — these can be linked to savings goals.
+        </p>
+      </Card>
+      <Card title="Liabilities" accent={C.red}>
+        <ItemTable items={data.liabilities} onChange={l.change} onAdd={l.add} onRemove={l.remove} valueLabel="Balance" />
+        <Total label="Total liabilities" value={sum(data.liabilities)} color={C.red} />
+      </Card>
+    </div>
+  );
+}
+
+function Total({ label, value, color }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", marginTop: 14, paddingTop: 14, borderTop: `2px solid ${C.ink}` }}>
+      <span className="serif" style={{ fontSize: 15 }}>{label}</span>
+      <span className="serif tnum" style={{ fontSize: 18, fontWeight: 700, color }}>{fmt(value)}</span>
+    </div>
+  );
+}
+
+// ---- Cash Flow tab ----
+function CashFlow({ data, persist, monthlyIncome, monthlyExpenses, monthlyNet }) {
+  const inc = useListEditor(data, persist, "income");
+  const exp = useListEditor(data, persist, "expenses");
+  return (
+    <>
+      <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 20 }}>
+        <Stat label="Monthly Income" value={fmt(monthlyIncome)} color={C.green} />
+        <Stat label="Monthly Expenses" value={fmt(monthlyExpenses)} color={C.red} />
+        <Stat label="Left Over" value={fmt(monthlyNet)} color={monthlyNet >= 0 ? C.forest : C.red} />
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 20 }}>
+        <Card title="Income" accent={C.green}>
+          <ItemTable items={data.income} onChange={inc.change} onAdd={inc.add} onRemove={inc.remove} valueLabel="Monthly" />
+          <Total label="Total income" value={monthlyIncome} color={C.green} />
+        </Card>
+        <Card title="Expenses" accent={C.red}>
+          <ItemTable items={data.expenses} onChange={exp.change} onAdd={exp.add} onRemove={exp.remove} valueLabel="Monthly" />
+          <Total label="Total expenses" value={monthlyExpenses} color={C.red} />
+        </Card>
+      </div>
+    </>
+  );
+}
+
+// ---- Goals tab ----
+function Goals({ data, persist, monthlyNet, monthlyExpenses }) {
+  const liquidAssets = data.assets.filter((a) => a.liquid);
+
+  // Ensure all goals have required fields
+  const goals = data.goals.map((g, i) => ({
+    isEmergencyFund: false, expenseMonths: 3, priority: i, splitWeight: 100, linkedAssets: [], saved: 0,
+    ...g,
+  }));
+
+  const updateGoal = (id, updates) =>
+    persist({ ...data, goals: goals.map((g) => g.id === id ? { ...g, ...updates } : g) });
+
+  const addGoal = () => {
+    const maxPriority = goals.length > 0 ? Math.max(...goals.map((g) => g.priority)) : 0;
+    persist({ ...data, goals: [...goals, { id: "g" + Date.now(), name: "New goal", target: 10000, saved: 0, linkedAssets: [], isEmergencyFund: false, expenseMonths: 3, priority: maxPriority + 1, splitWeight: 100 }] });
+  };
+
+  const removeGoal = (id) => persist({ ...data, goals: goals.filter((g) => g.id !== id) });
+
+  const moveGoal = (id, dir) => {
+    // Swap priorities with neighbour
+    const sorted = [...goals].sort((a, b) => a.priority - b.priority);
+    const idx = sorted.findIndex((g) => g.id === id);
+    const swapIdx = idx + dir;
+    if (swapIdx < 0 || swapIdx >= sorted.length) return;
+    // Don't move above emergency fund
+    if (sorted[swapIdx].isEmergencyFund && dir === -1) return;
+    if (sorted[idx].isEmergencyFund && dir === 1) return;
+    const newGoals = goals.map((g) => {
+      if (g.id === sorted[idx].id) return { ...g, priority: sorted[swapIdx].priority };
+      if (g.id === sorted[swapIdx].id) return { ...g, priority: sorted[idx].priority };
+      return g;
+    });
+    persist({ ...data, goals: newGoals });
+  };
+
+  // ---- Liquid pool: total accessible money to distribute across goals ----
+  // All liquid assets form ONE pool. It fills goals in priority order:
+  // goal 1 takes what it needs, the remainder flows to goal 2, etc.
+  const totalLiquid = sum(liquidAssets);
+
+  const sortedGoals = [...goals].sort((a, b) => a.priority - b.priority);
+
+  // Build priority tiers (goals sharing a priority split within the tier)
+  const buildTiers = () => {
+    const tiers = [];
+    sortedGoals.forEach((g) => {
+      const target = g.isEmergencyFund ? Math.round((g.expenseMonths || 3) * monthlyExpenses) : (g.target || 0);
+      const last = tiers[tiers.length - 1];
+      const entry = { ...g, _target: target };
+      if (last && last.priority === g.priority) last.goals.push(entry);
+      else tiers.push({ priority: g.priority, goals: [entry] });
+    });
+    return tiers;
+  };
+  const tiers = buildTiers();
+
+  // Cascade the liquid pool down the tiers → savedAlloc[goalId]
+  const savedAlloc = {};
+  let liquidLeft = totalLiquid;
+  tiers.forEach((tier) => {
+    const need = tier.goals.map((g) => ({ id: g.id, target: g._target, weight: g.splitWeight || 100 }));
+    const tierNeed = need.reduce((t, n) => t + n.target, 0);
+    if (liquidLeft <= 0) { need.forEach((n) => { savedAlloc[n.id] = 0; }); return; }
+    const tierBudget = Math.min(liquidLeft, tierNeed);
+    if (tier.goals.length === 1) {
+      savedAlloc[tier.goals[0].id] = Math.min(tier.goals[0]._target, tierBudget);
+    } else {
+      // Split by weight, but cap each at its target and redistribute overflow
+      const totalWeight = need.reduce((t, n) => t + n.weight, 0);
+      let pool = tierBudget;
+      const order = [...need];
+      order.forEach((n) => { savedAlloc[n.id] = 0; });
+      // iterative fill so overflow from a capped goal flows to the others
+      let active = order.filter((n) => savedAlloc[n.id] < n.target);
+      while (pool > 1 && active.length > 0) {
+        const w = active.reduce((t, n) => t + n.weight, 0);
+        let distributed = 0;
+        active.forEach((n) => {
+          const give = Math.min(n.target - savedAlloc[n.id], (pool * n.weight) / w);
+          savedAlloc[n.id] += give;
+          distributed += give;
+        });
+        pool -= distributed;
+        active = order.filter((n) => savedAlloc[n.id] < n.target - 0.5);
+        if (distributed < 1) break;
+      }
+      need.forEach((n) => { savedAlloc[n.id] = Math.round(savedAlloc[n.id]); });
+    }
+    const used = tier.goals.reduce((t, g) => t + (savedAlloc[g.id] || 0), 0);
+    liquidLeft -= used;
+  });
+  const unallocatedLiquid = Math.max(0, Math.round(liquidLeft));
+
+  // ---- Surplus waterfall: how monthly surplus fills the REMAINING gaps ----
+  let remainingSurplus = Math.max(0, monthlyNet);
+  const surplusAlloc = {};
+  tiers.forEach((tier) => {
+    const incomplete = tier.goals
+      .map((g) => ({ ...g, _remaining: Math.max(0, g._target - (savedAlloc[g.id] || 0)) }))
+      .filter((g) => g._remaining > 0);
+    if (incomplete.length === 0 || remainingSurplus <= 0) {
+      tier.goals.forEach((g) => { surplusAlloc[g.id] = surplusAlloc[g.id] || 0; });
+      return;
+    }
+    const totalWeight = incomplete.reduce((t, g) => t + (g.splitWeight || 100), 0);
+    const tierNeeded = incomplete.reduce((t, g) => t + g._remaining, 0);
+    const tierBudget = Math.min(remainingSurplus, tierNeeded);
+    incomplete.forEach((g) => {
+      const share = (g.splitWeight || 100) / totalWeight;
+      surplusAlloc[g.id] = Math.min(g._remaining, Math.round(tierBudget * share));
+    });
+    remainingSurplus -= tierBudget;
+  });
+
+  // Helper: per-goal computed values
+  const goalCompute = (g) => {
+    const target = g.isEmergencyFund ? Math.round((g.expenseMonths || 3) * monthlyExpenses) : (g.target || 0);
+    const saved = savedAlloc[g.id] || 0;
+    const remaining = Math.max(0, target - saved);
+    const pct = target > 0 ? Math.min(100, Math.round((saved / target) * 100)) : 0;
+    const alloc = surplusAlloc[g.id] || 0;
+    const months = alloc > 0 ? Math.ceil(remaining / alloc) : null;
+    const done = remaining <= 0 && target > 0;
+    return { target, saved, remaining, pct, alloc, months, done };
+  };
+
+  const efGoal = goals.find((g) => g.isEmergencyFund);
+
+  return (
+    <>
+      {/* Liquid pool summary */}
+      <Card title="How your savings are allocated" accent={C.moss}>
+        <p style={{ fontSize: 13, color: C.muted, marginTop: 0, marginBottom: 12, lineHeight: 1.6 }}>
+          Your <strong className="tnum" style={{ color: C.forest }}>{fmt(totalLiquid)}</strong> in liquid accounts fills goals top to bottom. Each goal takes what it needs; the rest flows to the next.
+        </p>
+        <div>
+          {sortedGoals.map((g, i) => {
+            const { saved, target, done } = goalCompute(g);
+            return (
+              <div key={g.id} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                <div style={{ width: 22, height: 22, borderRadius: "50%", background: done ? C.green : saved > 0 ? C.moss : C.line,
+                  color: done || saved > 0 ? "#fff" : C.muted, display: "grid", placeItems: "center", fontSize: 11, fontWeight: 700, flexShrink: 0 }}>
+                  {done ? "✓" : i + 1}
+                </div>
+                <div style={{ flex: 1, fontSize: 13 }}>
+                  <span style={{ color: done ? C.green : C.ink, fontWeight: done ? 600 : 400 }}>{g.name}</span>
+                </div>
+                <span className="tnum" style={{ fontSize: 13, fontWeight: 700, color: saved > 0 ? C.forest : C.muted }}>
+                  {fmt(saved)} / {fmt(target)}
+                </span>
+              </div>
+            );
+          })}
+          {unallocatedLiquid > 0 && (
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 10, paddingTop: 10, borderTop: `1px dashed ${C.line}` }}>
+              <div style={{ width: 22, height: 22, borderRadius: "50%", background: C.brass, color: "#fff", display: "grid", placeItems: "center", fontSize: 12, flexShrink: 0 }}>✦</div>
+              <div style={{ flex: 1, fontSize: 13, color: C.ink }}>Unallocated — all goals funded</div>
+              <span className="tnum" style={{ fontSize: 13, fontWeight: 700, color: C.brass }}>{fmt(unallocatedLiquid)}</span>
+            </div>
+          )}
+        </div>
+      </Card>
+
+      {/* Surplus flow summary */}
+      {monthlyNet > 0 && (
+        <Card title="Monthly surplus flow" accent={C.brass}>
+          <p style={{ fontSize: 13, color: C.muted, marginTop: 0, marginBottom: 12, lineHeight: 1.6 }}>
+            Your <strong className="tnum" style={{ color: C.forest }}>{fmt(monthlyNet)}</strong> monthly surplus fills the remaining gaps, in the same priority order.
+          </p>
+          <div>
+            {sortedGoals.map((g, i) => {
+              const { alloc, done } = goalCompute(g);
+              return (
+                <div key={g.id} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                  <div style={{ width: 22, height: 22, borderRadius: "50%", background: done ? C.green : alloc > 0 ? C.brass : C.line,
+                    color: done || alloc > 0 ? "#fff" : C.muted, display: "grid", placeItems: "center", fontSize: 11, fontWeight: 700, flexShrink: 0 }}>
+                    {done ? "✓" : i + 1}
+                  </div>
+                  <div style={{ flex: 1, fontSize: 13 }}>
+                    <span style={{ color: done ? C.green : C.ink, fontWeight: done ? 600 : 400 }}>{g.name}</span>
+                    {done && <span style={{ color: C.green, fontSize: 12, marginLeft: 6 }}>Funded</span>}
+                  </div>
+                  <span className="tnum" style={{ fontSize: 13, fontWeight: 700, color: alloc > 0 ? C.brass : C.muted }}>
+                    {alloc > 0 ? `+${fmt(alloc)}/mo` : done ? "—" : "waiting"}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
+
+      {/* Individual goal cards */}
+      {sortedGoals.map((g, sortedIdx) => {
+        const { target, saved, remaining, pct, alloc, months, done } = goalCompute(g);
+
+        // Find goals at same priority tier for split UI
+        const tierMates = goals.filter((x) => x.priority === g.priority && x.id !== g.id);
+        const isFirstInTier = sortedGoals.find((x) => x.priority === g.priority)?.id === g.id;
+
+        return (
+          <Card key={g.id}>
+            {/* Header row: priority badge + name + move buttons + delete */}
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+              <div style={{ width: 26, height: 26, borderRadius: "50%", background: done ? C.green : C.brass,
+                color: "#fff", display: "grid", placeItems: "center", fontSize: 12, fontWeight: 700, flexShrink: 0 }}>
+                {done ? "✓" : sortedIdx + 1}
+              </div>
+              <input className="cell namecell serif" style={{ fontSize: 17, flex: 1 }}
+                value={g.name} onChange={(e) => updateGoal(g.id, { name: e.target.value })} />
+              {!g.isEmergencyFund && (
+                <div style={{ display: "flex", gap: 2 }}>
+                  <button onClick={() => moveGoal(g.id, -1)} title="Move up" style={{ background: "none", border: "none", color: C.muted, padding: 4, fontSize: 14 }}>↑</button>
+                  <button onClick={() => moveGoal(g.id, 1)} title="Move down" style={{ background: "none", border: "none", color: C.muted, padding: 4, fontSize: 14 }}>↓</button>
+                </div>
+              )}
+              {g.isEmergencyFund && (
+                <span style={{ fontSize: 11, background: C.forest, color: C.paper, padding: "2px 8px", borderRadius: 10, whiteSpace: "nowrap" }}>🛡 Emergency</span>
+              )}
+              {!g.isEmergencyFund && (
+                <button onClick={() => removeGoal(g.id)} style={{ background: "none", border: "none", color: C.muted, padding: 4 }}>
+                  <Ic d="M3 6h18|M8 6V4h8v2|M19 6l-1 14H6L5 6|M10 11v6|M14 11v6" size={15} />
+                </button>
+              )}
+            </div>
+
+            {/* Progress bar */}
+            <div style={{ height: 16, background: C.paper, borderRadius: 8, overflow: "hidden", margin: "12px 0 5px" }}>
+              <div style={{ width: `${pct}%`, height: "100%", background: done ? C.green : `linear-gradient(90deg, ${C.moss}, ${C.brass})`, borderRadius: 8, transition: "width .4s" }} />
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: C.muted, marginBottom: 14 }}>
+              <span className="tnum">{fmt(saved)} of {fmt(target)}</span>
+              <span style={{ fontWeight: 700, color: done ? C.green : C.forest }}>{done ? "🎉 Done!" : `${pct}%`}</span>
+            </div>
+
+            {/* Emergency fund: months-of-expenses target */}
+            {g.isEmergencyFund && (
+              <div style={{ background: C.paper, borderRadius: 10, padding: 12, marginBottom: 14 }}>
+                <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 1, color: C.muted, marginBottom: 10 }}>Target: months of expenses</div>
+                <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                  {[3, 4, 5, 6].map((mo) => (
+                    <button key={mo} onClick={() => updateGoal(g.id, { expenseMonths: mo })}
+                      style={{ flex: 1, padding: "8px 4px", borderRadius: 8, border: `2px solid ${g.expenseMonths === mo ? C.forest : C.line}`,
+                        background: g.expenseMonths === mo ? C.forest : "transparent",
+                        color: g.expenseMonths === mo ? C.paper : C.muted, fontSize: 13, fontWeight: g.expenseMonths === mo ? 700 : 400 }}>
+                      {mo}mo
+                    </button>
+                  ))}
+                </div>
+                <p style={{ fontSize: 12, color: C.muted, margin: 0 }}>
+                  {g.expenseMonths} months × {fmt(monthlyExpenses)}/mo = <strong style={{ color: C.forest }}>{fmt(target)}</strong> target
+                </p>
+              </div>
+            )}
+
+            {/* Manual target for non-EF goals */}
+            {!g.isEmergencyFund && (
+              <label style={{ fontSize: 12, color: C.muted, display: "block", marginBottom: 14 }}>
+                Target ($)
+                <input className="cell tnum" type="number" value={g.target}
+                  onChange={(e) => updateGoal(g.id, { target: Number(e.target.value) })}
+                  style={{ border: `1px solid ${C.line}`, marginTop: 4, borderRadius: 6, display: "block", width: 140 }} />
+              </label>
+            )}
+
+            {/* Priority / split weight */}
+            {!g.isEmergencyFund && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 1, color: C.muted, marginBottom: 8 }}>Priority tier</div>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 13, color: C.muted }}>Share tier with:</span>
+                  {goals.filter((x) => !x.isEmergencyFund && x.id !== g.id).map((other) => {
+                    const shared = other.priority === g.priority;
+                    return (
+                      <button key={other.id} onClick={() => {
+                        if (shared) {
+                          // Give this goal its own new priority slot between its current and next
+                          const sorted2 = [...goals].sort((a, b) => a.priority - b.priority);
+                          const myIdx = sorted2.findIndex((x) => x.id === g.id);
+                          const nextPrio = myIdx < sorted2.length - 1 ? sorted2[myIdx + 1].priority : g.priority + 2;
+                          updateGoal(g.id, { priority: g.priority + (nextPrio - g.priority) / 2 });
+                        } else {
+                          updateGoal(g.id, { priority: other.priority });
+                        }
+                      }}
+                        style={{ padding: "5px 12px", borderRadius: 16, fontSize: 12,
+                          background: shared ? C.moss : C.paper, color: shared ? C.paper : C.muted,
+                          border: `1px solid ${shared ? C.moss : C.line}` }}>
+                        {shared ? "✓ " : ""}{other.name}
+                      </button>
+                    );
+                  })}
+                </div>
+                {/* Split weight slider — only shown if in a shared tier */}
+                {tierMates.length > 0 && (
+                  <div style={{ marginTop: 12 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: C.muted, marginBottom: 4 }}>
+                      <span>Split weight for this goal</span>
+                      <span className="tnum" style={{ fontWeight: 700, color: C.forest }}>{g.splitWeight}%</span>
+                    </div>
+                    <input type="range" min={10} max={90} step={5} value={g.splitWeight}
+                      onChange={(e) => updateGoal(g.id, { splitWeight: Number(e.target.value) })}
+                      style={{ width: "100%", accentColor: C.brass }} />
+                    {isFirstInTier && (
+                      <p style={{ fontSize: 12, color: C.muted, marginTop: 4, marginBottom: 0 }}>
+                        Surplus split: {g.name} gets {g.splitWeight}% · {tierMates.map((x) => `${x.name} gets ${100 - g.splitWeight}%`).join(" · ")}
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Funded-from-pool display */}
+            {liquidAssets.length > 0 ? (
+              <div style={{ background: C.paper, borderRadius: 8, padding: "10px 12px", marginBottom: 14, fontSize: 13, color: C.muted }}>
+                {saved > 0
+                  ? <>Funded with <strong className="tnum" style={{ color: C.forest }}>{fmt(saved)}</strong> from your liquid pool{remaining > 0 ? <>, <span className="tnum">{fmt(remaining)}</span> to go.</> : " — fully funded from savings."}</>
+                  : <>Nothing allocated yet — higher-priority goals are using the available liquid funds first.</>}
+              </div>
+            ) : (
+              <label style={{ fontSize: 12, color: C.muted, display: "block", marginBottom: 14 }}>
+                {g.isEmergencyFund ? "Current balance ($)" : "Saved ($)"}
+                <input className="cell tnum" type="number" value={g.saved}
+                  onChange={(e) => updateGoal(g.id, { saved: Number(e.target.value) })}
+                  style={{ border: `1px solid ${C.line}`, marginTop: 4, borderRadius: 6, display: "block", width: 140 }} />
+              </label>
+            )}
+
+            {/* Timeline */}
+            {!done && (
+              <p style={{ fontSize: 13, color: C.muted, marginTop: 4, marginBottom: 0 }}>
+                {alloc > 0
+                  ? <>Receiving <strong className="tnum" style={{ color: C.brass }}>{fmt(alloc)}/mo</strong> from your surplus → funded in ~<strong style={{ color: C.forest }}>{months} month{months !== 1 ? "s" : ""}</strong>.</>
+                  : monthlyNet <= 0
+                    ? "No monthly surplus to allocate — update Cash Flow."
+                    : "Waiting — higher-priority goals are being funded first."}
+              </p>
+            )}
+          </Card>
+        );
+      })}
+
+      {liquidAssets.length === 0 && (
+        <div style={{ background: C.card, border: `1px dashed ${C.line}`, borderRadius: 12, padding: 14, marginBottom: 14, fontSize: 13, color: C.muted }}>
+          💡 Go to <strong>Net Worth</strong> and tap 💧 next to accessible accounts so they fund your goals automatically.
+        </div>
+      )}
+
+      <button onClick={addGoal} style={{ display: "flex", alignItems: "center", gap: 6, background: C.forest, border: "none", color: C.paper, padding: "10px 18px", borderRadius: 8, fontSize: 14 }}>
+        <Ic d="M12 5v14|M5 12h14" size={16} /> Add a goal
+      </button>
+    </>
+  );
+}
+
+// ---- Net Worth History tab ----
+function NetWorthHistory({ data, persist, netWorth, totalAssets, totalLiabilities }) {
+  const history = [...(data.history || [])].sort((a, b) => a.month.localeCompare(b.month));
+
+  const currentMonth = new Date().toISOString().slice(0, 7); // YYYY-MM
+  const [logMonth, setLogMonth] = useState(currentMonth);
+
+  const logSnapshot = () => {
+    const entry = { id: "h" + Date.now(), month: logMonth, netWorth, assets: totalAssets, liabilities: totalLiabilities };
+    // Replace if a snapshot for that month already exists
+    const others = (data.history || []).filter((h) => h.month !== logMonth);
+    persist({ ...data, history: [...others, entry] });
+  };
+
+  const removeSnapshot = (id) => persist({ ...data, history: (data.history || []).filter((h) => h.id !== id) });
+
+  const existing = history.find((h) => h.month === logMonth);
+  const first = history[0];
+  const last = history[history.length - 1];
+  const change = first && last ? last.netWorth - first.netWorth : 0;
+
+  const labelMonth = (m) => {
+    const [y, mo] = m.split("-");
+    return new Date(Number(y), Number(mo) - 1, 1).toLocaleDateString("en-US", { month: "short", year: "2-digit" });
+  };
+
+  return (
+    <>
+      <Card title="Log this month's snapshot" accent={C.brass}>
+        <p style={{ color: C.muted, fontSize: 14, marginTop: 0, lineHeight: 1.6 }}>
+          Your net worth right now is <strong className="tnum" style={{ color: C.forest }}>{fmt(netWorth)}</strong> (assets {fmt(totalAssets)} − liabilities {fmt(totalLiabilities)}).
+          Pick a month and save it to your history. Logging the same month again updates that entry.
+        </p>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+          <input type="month" value={logMonth} onChange={(e) => setLogMonth(e.target.value)}
+            style={{ border: `1px solid ${C.line}`, borderRadius: 8, padding: "9px 12px", font: "inherit", color: C.ink, background: "#fff" }} />
+          <button onClick={logSnapshot}
+            style={{ display: "flex", alignItems: "center", gap: 7, background: C.forest, border: "none", color: C.paper, padding: "10px 18px", borderRadius: 8, fontSize: 14 }}>
+            <Ic d="M8 2v4|M16 2v4|M3 10h18|M5 4h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z|M12 14v4|M10 16h4" size={16} /> {existing ? "Update this month" : "Save snapshot"}
+          </button>
+        </div>
+      </Card>
+
+      {history.length === 0 ? (
+        <Card>
+          <div style={{ textAlign: "center", padding: "20px 0", color: C.muted }}>
+            <Ic d="M3 3v5h5|M3.05 13A9 9 0 1 0 6 5.3L3 8|M12 7v5l4 2" size={28} />
+            <p style={{ marginBottom: 0 }}>No snapshots yet. Save one above to start your chart — then check back each month to watch the line grow.</p>
+          </div>
+        </Card>
+      ) : (
+        <>
+          <Card title="Net worth over time" accent={C.forest}>
+            {history.length >= 2 && (
+              <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 18 }}>
+                <MiniStat label="First logged" value={fmt(first.netWorth)} />
+                <MiniStat label="Latest" value={fmt(last.netWorth)} color={C.forest} />
+                <MiniStat label="Change" value={`${change >= 0 ? "+" : ""}${fmt(change)}`} color={change >= 0 ? C.green : C.red} />
+              </div>
+            )}
+            <HistoryChart history={history} labelMonth={labelMonth} />
+          </Card>
+
+          <Card title="Logged snapshots">
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 40px", padding: "0 8px 8px", fontSize: 12, textTransform: "uppercase", letterSpacing: 1, color: C.muted, borderBottom: `1px solid ${C.line}` }}>
+              <span>Month</span><span style={{ textAlign: "right" }}>Net worth</span><span style={{ textAlign: "right" }}>Assets / Liab.</span><span />
+            </div>
+            {[...history].reverse().map((h) => (
+              <div key={h.id} className="row-in" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 40px", alignItems: "center", borderBottom: `1px solid ${C.line}`, padding: "10px 8px" }}>
+                <span className="serif" style={{ fontSize: 15 }}>{labelMonth(h.month)}</span>
+                <span className="tnum" style={{ textAlign: "right", fontWeight: 700, color: C.forest }}>{fmt(h.netWorth)}</span>
+                <span className="tnum" style={{ textAlign: "right", fontSize: 13, color: C.muted }}>{fmt(h.assets)} / {fmt(h.liabilities)}</span>
+                <button onClick={() => removeSnapshot(h.id)} style={{ background: "none", border: "none", color: C.muted, display: "grid", placeItems: "center" }} title="Remove">
+                  <Ic d="M3 6h18|M8 6V4h8v2|M19 6l-1 14H6L5 6|M10 11v6|M14 11v6" size={15} />
+                </button>
+              </div>
+            ))}
+          </Card>
+        </>
+      )}
+    </>
+  );
+}
+
+function HistoryChart({ history, labelMonth }) {
+  const W = 720, H = 260, padL = 64, padR = 20, padT = 20, padB = 36;
+  const vals = history.map((h) => h.netWorth);
+  const maxV = Math.max(...vals);
+  const minV = Math.min(...vals, 0);
+  const range = maxV - minV || 1;
+
+  const n = history.length;
+  const x = (i) => padL + (n === 1 ? (W - padL - padR) / 2 : (i / (n - 1)) * (W - padL - padR));
+  const y = (v) => padT + (1 - (v - minV) / range) * (H - padT - padB);
+
+  const points = history.map((h, i) => ({ px: x(i), py: y(h.netWorth), ...h }));
+  const linePath = points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.px} ${p.py}`).join(" ");
+  const areaPath = `${linePath} L ${points[n - 1].px} ${H - padB} L ${points[0].px} ${H - padB} Z`;
+
+  // gridlines at 0%, 50%, 100%
+  const gridVals = [minV, minV + range / 2, maxV];
+
+  return (
+    <div style={{ width: "100%", overflowX: "auto" }}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", minWidth: 320, display: "block" }} role="img" aria-label="Net worth history line chart">
+        <defs>
+          <linearGradient id="nwfill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={C.moss} stopOpacity="0.35" />
+            <stop offset="100%" stopColor={C.moss} stopOpacity="0" />
+          </linearGradient>
+        </defs>
+        {gridVals.map((gv, i) => (
+          <g key={i}>
+            <line x1={padL} y1={y(gv)} x2={W - padR} y2={y(gv)} stroke={C.line} strokeWidth="1" />
+            <text x={padL - 10} y={y(gv) + 4} textAnchor="end" fontSize="11" fill={C.muted} fontFamily="Georgia, serif">
+              {fmt(gv)}
+            </text>
+          </g>
+        ))}
+        {n >= 2 && <path d={areaPath} fill="url(#nwfill)" />}
+        {n >= 2 && <path d={linePath} fill="none" stroke={C.forest} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />}
+        {points.map((p, i) => (
+          <g key={p.id}>
+            <circle cx={p.px} cy={p.py} r="4.5" fill={C.brass} stroke="#fff" strokeWidth="2" />
+            {(i === 0 || i === n - 1 || n <= 6) && (
+              <text x={p.px} y={H - padB + 18} textAnchor="middle" fontSize="11" fill={C.muted} fontFamily="Georgia, serif">
+                {labelMonth(p.month)}
+              </text>
+            )}
+          </g>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+// ---- Scenario tab ----
+function Scenario({ netWorth, monthlyNet, totalAssets }) {
+  const [monthlySave, setMonthlySave] = useState(Math.max(0, monthlyNet));
+  const [years, setYears] = useState(10);
+  const [rate, setRate] = useState(6);
+
+  const months = years * 12;
+  const r = rate / 100 / 12;
+  // Future value of invested assets + monthly contributions
+  const fvAssets = totalAssets * Math.pow(1 + r, months);
+  const fvContrib = r > 0 ? monthlySave * ((Math.pow(1 + r, months) - 1) / r) : monthlySave * months;
+  const projected = fvAssets + fvContrib;
+  const contributed = monthlySave * months;
+  const growth = projected - totalAssets - contributed;
+
+  const Slider = ({ label, value, set, min, max, step, suffix }) => (
+    <div style={{ marginBottom: 22 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+        <span style={{ fontSize: 14, color: C.ink }}>{label}</span>
+        <span className="serif tnum" style={{ fontWeight: 700, color: C.forest }}>{suffix === "$" ? fmt(value) : `${value}${suffix}`}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => set(Number(e.target.value))}
+        style={{ width: "100%", accentColor: C.brass }} />
+    </div>
+  );
+
+  return (
+    <>
+      <Card title="What if we keep this up?">
+        <p style={{ color: C.muted, fontSize: 14, marginTop: 0, lineHeight: 1.6 }}>
+          Project how your invested assets grow over time. Adjust how much you set aside monthly, the time horizon, and an assumed annual return.
+        </p>
+        <Slider label="Saved & invested per month" value={monthlySave} set={setMonthlySave} min={0} max={10000} step={100} suffix="$" />
+        <Slider label="Time horizon" value={years} set={setYears} min={1} max={40} step={1} suffix=" yrs" />
+        <Slider label="Assumed annual return" value={rate} set={setRate} min={0} max={12} step={0.5} suffix="%" />
+      </Card>
+
+      <Card title={`Projected in ${years} years`} accent={C.brass}>
+        <div className="serif tnum" style={{ fontSize: 40, fontWeight: 700, color: C.forest }}>{fmt(projected)}</div>
+        <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginTop: 18 }}>
+          <MiniStat label="Starting assets" value={fmt(totalAssets)} />
+          <MiniStat label="You contribute" value={fmt(contributed)} />
+          <MiniStat label="Growth earned" value={fmt(growth)} color={C.brass} />
+        </div>
+        <p style={{ fontSize: 12, color: C.muted, marginTop: 18, marginBottom: 0, lineHeight: 1.5 }}>
+          A simplified projection assuming steady contributions and a constant return, compounded monthly. Real markets vary year to year — treat this as a directional estimate, not a guarantee.
+        </p>
+      </Card>
+    </>
+  );
+}
+
+function MiniStat({ label, value, color }) {
+  return (
+    <div style={{ flex: "1 1 140px" }}>
+      <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 1, color: C.muted }}>{label}</div>
+      <div className="serif tnum" style={{ fontSize: 20, fontWeight: 700, color: color || C.ink, marginTop: 4 }}>{value}</div>
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<FinanceTracker />);
+</script>
+</body>
+</html>
