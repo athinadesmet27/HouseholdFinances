@@ -579,6 +579,8 @@ function Total({ label, value, color }) {
 function CashFlow({ data, persist, monthlyIncome, monthlyExpenses, monthlyNet }) {
   const inc = useListEditor(data, persist, "income");
   const exp = useListEditor(data, persist, "expenses");
+  const reorderIncome = (next) => persist({ ...data, income: next });
+  const reorderExpenses = (next) => persist({ ...data, expenses: next });
   return (
     <>
       <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 20 }}>
@@ -588,11 +590,11 @@ function CashFlow({ data, persist, monthlyIncome, monthlyExpenses, monthlyNet })
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 20 }}>
         <Card title="Income" accent={C.green}>
-          <ItemTable items={data.income} onChange={inc.change} onAdd={inc.add} onRemove={inc.remove} valueLabel="Monthly" />
+          <ItemTable items={data.income} onChange={inc.change} onAdd={inc.add} onRemove={inc.remove} onReorder={reorderIncome} valueLabel="Monthly" />
           <Total label="Total income" value={monthlyIncome} color={C.green} />
         </Card>
         <Card title="Expenses" accent={C.red}>
-          <ItemTable items={data.expenses} onChange={exp.change} onAdd={exp.add} onRemove={exp.remove} valueLabel="Monthly" />
+          <ItemTable items={data.expenses} onChange={exp.change} onAdd={exp.add} onRemove={exp.remove} onReorder={reorderExpenses} valueLabel="Monthly" />
           <Total label="Total expenses" value={monthlyExpenses} color={C.red} />
         </Card>
       </div>
