@@ -61,8 +61,8 @@ function saveLocal(d) {
 function migrate(d) {
   const base = JSON.parse(JSON.stringify(DEFAULT_DATA));
   const out = { ...base, ...d };
-  out.assets = (d.assets || base.assets).map((a) => ({ liquid: false, ...a }));
-  out.liabilities = d.liabilities || base.liabilities;
+  out.assets = (d.assets || base.assets).map((a) => ({ liquid: false, growthRate: DEFAULT_ASSET_GROWTH, ...a }));
+  out.liabilities = (d.liabilities || base.liabilities).map((x) => ({ rate: 0, payment: 0, ...x }));
   out.income = d.income || base.income;
   out.expenses = d.expenses || base.expenses;
   out.history = d.history || [];
@@ -70,6 +70,8 @@ function migrate(d) {
     isEmergencyFund: false, expenseMonths: 3, priority: i, splitWeight: 100,
     linkedAssets: [], saved: 0, target: 0, ...g,
   }));
+  out.assumptions = { ...base.assumptions, ...(d.assumptions || {}) };
+  out.scenarios = d.scenarios || [];
   return out;
 }
 
@@ -92,14 +94,14 @@ function Ic({ d, size = 16 }) {
 
 const DEFAULT_DATA = {
   assets: [
-    { id: "a1", name: "Checking", value: 12000, liquid: true },
-    { id: "a2", name: "Savings", value: 38000, liquid: true },
-    { id: "a3", name: "401(k) / Retirement", value: 145000, liquid: false },
-    { id: "a4", name: "Home equity", value: 210000, liquid: false },
+    { id: "a1", name: "Checking", value: 12000, liquid: true, growthRate: 0 },
+    { id: "a2", name: "Savings", value: 38000, liquid: true, growthRate: 4 },
+    { id: "a3", name: "401(k) / Retirement", value: 145000, liquid: false, growthRate: 7 },
+    { id: "a4", name: "Home equity", value: 210000, liquid: false, growthRate: 3 },
   ],
   liabilities: [
-    { id: "l1", name: "Mortgage", value: 320000 },
-    { id: "l2", name: "Car loan", value: 14000 },
+    { id: "l1", name: "Mortgage", value: 320000, rate: 6.5, payment: 2400 },
+    { id: "l2", name: "Car loan", value: 14000, rate: 5, payment: 450 },
   ],
   income: [
     { id: "i1", name: "Salary — primary", value: 8500 },
@@ -116,12 +118,299 @@ const DEFAULT_DATA = {
     { id: "g2", name: "Family trip", target: 8000, saved: 2400, linkedAssets: [], isEmergencyFund: false, expenseMonths: 3, priority: 1, splitWeight: 100 },
   ],
   history: [],
+  assumptions: {
+    horizonYears: 20,        // how far the projection looks ahead
+    incomeGrowth: 3,         // annual % raise applied to income
+    expenseGrowth: 3,        // annual % inflation applied to expenses
+    overflowAssetId: null,   // where leftover surplus goes (defaults to highest-growth)
+  },
+  scenarios: [],             // Pass 2 will populate this
 };
+
+// Default growth rate to assume for an asset that has none set
+const DEFAULT_ASSET_GROWTH = 4;
 
 const fmt = (n) =>
   n.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
 
 const sum = (arr) => arr.reduce((t, x) => t + (Number(x.value) || 0), 0);
+
+// Short month label from a Date
+const monthLabel = (d) => d.toLocaleDateString("en-US", { month: "short", year: "2-digit" });
+const fmtSigned = (n) => (n >= 0 ? "+" : "") + fmt(n);
+
+// Derive a home event's mortgage amount and monthly payment from its inputs.
+// amount = home value − down payment; payment = amortized over termYears at rate.
+function deriveMortgage(ev) {
+  const homeValue = Number(ev.newAssetValue) || 0;
+  const down = Number(ev.downPayment) || 0;
+  const amount = Math.max(0, homeValue - down);
+  const term = Number(ev.termYears) || 30;
+  const rate = Number(ev.mortgageRate) || 0;
+  const nMonths = term * 12;
+  let payment = 0;
+  if (amount > 0 && nMonths > 0) {
+    const im = rate / 100 / 12;
+    payment = im > 0 ? (amount * im) / (1 - Math.pow(1 + im, -nMonths)) : amount / nMonths;
+  }
+  return { amount, payment, term };
+}
+
+/* ============================================================
+   PROJECTION ENGINE
+   Walks forward month-by-month from today. Pure function so it
+   can be reused by both the Projection tab and (Pass 2) Scenarios.
+
+   events: optional array applied during the walk. Each event:
+     { type, startMonth, endMonth?, ... }  where *Month is an
+     integer offset from now (0 = this month). Supported in Pass 2.
+   Returns { series:[{date,label,netWorth,assets,liabilities,surplus}],
+             milestones:[{label,monthIndex,date}] }
+   ============================================================ */
+function runProjection(data, opts = {}) {
+  const a = data.assumptions || {};
+  const horizonYears = opts.horizonYears || a.horizonYears || 20;
+  const months = Math.round(horizonYears * 12);
+  const incomeGrowthM = Math.pow(1 + (a.incomeGrowth || 0) / 100, 1 / 12);
+  const expenseGrowthM = Math.pow(1 + (a.expenseGrowth || 0) / 100, 1 / 12);
+  const events = opts.events || [];
+
+  // Asset working copies. Each tracks starting value, plus cumulative
+  // contributions and growth so the endpoint can be decomposed.
+  let assets = (data.assets || []).map((x) => ({
+    id: x.id, name: x.name, liquid: !!x.liquid,
+    value: Number(x.value) || 0,
+    start: Number(x.value) || 0,
+    contrib: 0, growth: 0,
+    rate: x.growthRate != null ? x.growthRate : DEFAULT_ASSET_GROWTH,
+    growthM: Math.pow(1 + (x.growthRate != null ? x.growthRate : DEFAULT_ASSET_GROWTH) / 100, 1 / 12),
+  }));
+  const assetById = (id) => assets.find((x) => x.id === id);
+  // Overflow destination: explicit choice, else highest-growth asset.
+  const overflowId = a.overflowAssetId && assetById(a.overflowAssetId)
+    ? a.overflowAssetId
+    : (assets.slice().sort((p, q) => q.rate - p.rate)[0] || {}).id;
+  const firstLiquid = () => assets.find((x) => x.liquid) || assets[0];
+
+  let liabilities = (data.liabilities || []).map((x) => {
+    const value = Number(x.value) || 0;
+    const rate = Number(x.rate) || 0;
+    let payment = Number(x.payment) || 0;
+    const mr = Number(x.monthsRemaining) || 0;
+    if (mr > 0 && value > 0) {
+      const i = rate / 100 / 12;
+      payment = i > 0 ? (value * i) / (1 - Math.pow(1 + i, -mr)) : value / mr;
+    }
+    return { ...x, value, rate, payment };
+  });
+
+  let income = sum(data.income || []);
+  let expenses = sum(data.expenses || []);
+
+  // Goal working state. Goals fill from surplus in priority order.
+  // - emergency fund target tracks inflated expenses each month
+  // - cash goals get consumed (removed from net worth) on completion
+  const goalState = (data.goals || []).map((g) => ({
+    id: g.id, name: g.name,
+    isEmergencyFund: !!g.isEmergencyFund,
+    expenseMonths: g.expenseMonths || 3,
+    fixedTarget: Number(g.target) || 0,
+    priority: g.priority != null ? g.priority : 99,
+    splitWeight: g.splitWeight || 100,
+    linkedAssets: g.linkedAssets || [],
+    saved: 0,            // amount accumulated toward this goal so far
+    completed: false,    // for one-time cash goals
+    fundedMonth: null,   // month index when first fully funded (for goal-delay analysis)
+  }));
+
+  // Which asset does a goal's money live in? First linked asset, else first liquid.
+  const goalAsset = (g) => {
+    for (const aid of g.linkedAssets) { const x = assetById(aid); if (x) return x; }
+    return firstLiquid();
+  };
+  // Seed each goal's starting progress by cascading the current liquid pool
+  // through goals in priority order (matches the Goals tab pool model, and
+  // avoids double-counting when several goals share one account).
+  const targetForSeed = (g) => g.isEmergencyFund ? g.expenseMonths * expenses : g.fixedTarget;
+  {
+    let pool = assets.filter((x) => x.liquid).reduce((t, x) => t + x.value, 0);
+    const ordered = goalState.slice().sort((p, q) => p.priority - q.priority);
+    for (const g of ordered) {
+      if (pool <= 0) { g.saved = 0; continue; }
+      const tgt = targetForSeed(g);
+      const fill = Math.min(pool, tgt);
+      g.saved = fill;
+      pool -= fill;
+      // a cash goal already fully covered by existing savings counts as
+      // pre-completed (its money is effectively already set aside)
+      if (!g.isEmergencyFund && fill >= tgt - 0.5) { g.completed = true; g.fundedMonth = 0; }
+      if (g.isEmergencyFund && fill >= tgt - 0.5) g.fundedMonth = 0;
+    }
+  }
+
+  const startDate = new Date(); startDate.setDate(1);
+  const series = [];
+  const milestones = [];
+  const noteMilestone = (label, i) => {
+    if (milestones.find((m) => m.label === label)) return;
+    const d = new Date(startDate); d.setMonth(d.getMonth() + i);
+    milestones.push({ label, monthIndex: i, date: new Date(d) });
+  };
+
+  const targetFor = (g) => g.isEmergencyFund ? g.expenseMonths * (expenses + recurringExpenseAdj(currentMonth)) : g.fixedTarget;
+
+  // Recurring deltas are RECOMPUTED each month from the events list (never
+  // mutate the carried-forward base). Returns the income/expense adjustment
+  // that applies in month i.
+  const recurringIncomeAdj = (i) => {
+    let d = 0;
+    for (const ev of events) {
+      if (ev.type === "income") {
+        const active = i >= (ev.startMonth || 0) && (ev.endMonth == null || i <= ev.endMonth);
+        if (active) d += ev.monthlyDelta || 0;
+      }
+      if (ev.type === "child") {
+        const leaveActive = i >= (ev.startMonth || 0) && (ev.leaveEndMonth == null || i <= ev.leaveEndMonth);
+        if (leaveActive) d += ev.leaveIncomeDelta || 0;
+      }
+    }
+    return d;
+  };
+  const recurringExpenseAdj = (i) => {
+    let d = 0;
+    for (const ev of events) {
+      if (ev.type === "expense") {
+        const active = i >= (ev.startMonth || 0) && (ev.endMonth == null || i <= ev.endMonth);
+        if (active) d += ev.monthlyDelta || 0;
+      }
+      if (ev.type === "child" && i >= (ev.startMonth || 0)) d += ev.monthlyExpense || 0;
+      if (ev.type === "home" && i >= (ev.startMonth || 0)) d += ev.housingCostDelta || 0;
+    }
+    return d;
+  };
+  let currentMonth = 0;
+
+  // One-time / structural effects fire exactly once, on the month they start.
+  const applyStructuralEvents = (i) => {
+    for (const ev of events) {
+      const justStarted = i === (ev.startMonth || 0);
+      if (!justStarted) continue;
+      if (ev.type === "child" && ev.oneTimeCost) { const l = firstLiquid(); if (l) l.value = Math.max(0, l.value - ev.oneTimeCost); }
+      if (ev.type === "onetime") { const l = firstLiquid(); if (l) l.value += ev.amount || 0; }
+      if (ev.type === "home") {
+        const l = firstLiquid();
+        if (l) l.value = Math.max(0, l.value - (ev.downPayment || 0) - (ev.closingCosts || 0));
+        const m = deriveMortgage(ev);
+        liabilities.push({ id: "ev-" + (ev.id || i), name: ev.label || "New mortgage", value: m.amount, rate: ev.mortgageRate || 0, payment: m.payment });
+        if (ev.newAssetValue) assets.push({ id: "evh-" + (ev.id || i), name: (ev.label || "New home") + " equity", liquid: false, value: ev.newAssetValue, start: 0, contrib: ev.newAssetValue, growth: 0, rate: ev.appreciation || 3, growthM: Math.pow(1 + (ev.appreciation || 3) / 100, 1 / 12) });
+      }
+    }
+  };
+
+  // Add money to a specific asset, tracked as a contribution
+  const contributeTo = (assetObj, amt) => { if (assetObj && amt) { assetObj.value += amt; assetObj.contrib += amt; } };
+
+  // Emergency-fund goal and the asset that holds its money (for breakdown clarity)
+  const efGoalState = goalState.find((g) => g.isEmergencyFund) || null;
+  const efHolderId = efGoalState ? (goalAsset(efGoalState) || {}).id : null;
+
+  for (let i = 0; i <= months; i++) {
+    currentMonth = i;
+    // structural events that change the books happen at the start of their month
+    applyStructuralEvents(i);
+
+    // effective income/expenses this month = drifting base + recomputed event deltas
+    const effIncome = income + recurringIncomeAdj(i);
+    const effExpenses = expenses + recurringExpenseAdj(i);
+
+    const totA = assets.reduce((t, x) => t + x.value, 0);
+    const totL = liabilities.reduce((t, x) => t + x.value, 0);
+    const surplus = effIncome - effExpenses;
+    const d = new Date(startDate); d.setMonth(d.getMonth() + i);
+    const efBalance = efGoalState ? Math.max(0, efGoalState.saved) : 0;
+    series.push({
+      date: new Date(d), label: monthLabel(d),
+      netWorth: totA - totL, assets: totA, liabilities: totL, surplus,
+      efBalance, efHolderId,
+      byAsset: assets.map((x) => ({ id: x.id, name: x.name, value: x.value })),
+    });
+
+    if (totL <= 0 && liabilities.length > 0) noteMilestone("All debt paid off", i);
+    liabilities.forEach((l) => { if (l.value <= 0.5) noteMilestone(`${l.name} paid off`, i); });
+
+    if (i === months) break;
+
+    // grow assets (track growth portion)
+    assets.forEach((x) => { const g = x.value * (x.growthM - 1); x.value += g; x.growth += g; });
+
+    // amortize liabilities
+    liabilities.forEach((l) => {
+      if (l.value <= 0) { l.value = 0; return; }
+      const interest = l.value * (l.rate / 100 / 12);
+      l.value = Math.max(0, l.value + interest - l.payment);
+    });
+
+    // ---- route surplus through the goals waterfall ----
+    let pool = effIncome - effExpenses;
+    if (pool > 0) {
+      // sort goals by priority, group ties into tiers (split by weight)
+      const live = goalState.filter((g) => !g.completed).sort((p, q) => p.priority - q.priority);
+      const tiers = [];
+      live.forEach((g) => {
+        const last = tiers[tiers.length - 1];
+        if (last && last.priority === g.priority) last.goals.push(g);
+        else tiers.push({ priority: g.priority, goals: [g] });
+      });
+
+      for (const tier of tiers) {
+        if (pool <= 0) break;
+        // each goal's remaining need
+        const needs = tier.goals.map((g) => ({ g, need: Math.max(0, targetFor(g) - g.saved) })).filter((x) => x.need > 0);
+        if (needs.length === 0) continue;
+        const tierWeight = needs.reduce((t, x) => t + (x.g.splitWeight || 100), 0);
+        const tierBudget = Math.min(pool, needs.reduce((t, x) => t + x.need, 0));
+        let used = 0;
+        needs.forEach(({ g, need }) => {
+          const share = (g.splitWeight || 100) / tierWeight;
+          const give = Math.min(need, tierBudget * share);
+          g.saved += give;
+          contributeTo(goalAsset(g), give);
+          used += give;
+          // cash goal completion → consume the money (remove from net worth)
+          if (!g.isEmergencyFund && g.saved >= targetFor(g) - 0.5) {
+            g.completed = true;
+            if (g.fundedMonth == null) g.fundedMonth = i + 1;
+            const ga = goalAsset(g);
+            if (ga) { ga.value = Math.max(0, ga.value - g.saved); ga.contrib -= g.saved; }
+            noteMilestone(`${g.name} funded & spent`, i + 1);
+          }
+          // emergency fund: record the first month it reaches its (current) target
+          if (g.isEmergencyFund && g.fundedMonth == null && g.saved >= targetFor(g) - 0.5) {
+            g.fundedMonth = i + 1;
+          }
+        });
+        pool -= used;
+      }
+
+      // overflow: everything left after goals → chosen destination asset
+      if (pool > 0) contributeTo(assetById(overflowId), pool);
+    } else if (pool < 0) {
+      // shortfall drawn from first liquid asset
+      const l = firstLiquid();
+      if (l) { l.value = Math.max(0, l.value + pool); l.contrib += pool; }
+    }
+
+    income *= incomeGrowthM;
+    expenses *= expenseGrowthM;
+  }
+
+  // Final per-asset decomposition
+  const breakdown = assets.map((x) => ({ id: x.id, name: x.name, start: x.start, contrib: x.contrib, growth: x.growth, end: x.value }));
+
+  const goalFunding = goalState.map((g) => ({ id: g.id, name: g.name, isEmergencyFund: g.isEmergencyFund, fundedMonth: g.fundedMonth }));
+
+  return { series, milestones, breakdown, overflowId, goalFunding };
+}
 
 // ---- Palette: deep forest + brass, warm-autumn leaning, ledger feel ----
 const C = {
@@ -243,7 +532,8 @@ function FinanceTracker() {
     { id: "history", label: "History", icon: "M3 3v5h5|M3.05 13A9 9 0 1 0 6 5.3L3 8|M12 7v5l4 2" },
     { id: "cashflow", label: "Cash Flow", icon: "M3 3v18h18|M18 9l-5 5-4-4-3 3" },
     { id: "goals", label: "Goals", icon: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z|M12 18a6 6 0 1 0 0-12 6 6 0 0 0 0 12z|M12 14a2 2 0 1 0 0-4 2 2 0 0 0 0 4z" },
-    { id: "scenario", label: "Scenarios", icon: "M19 8a7 7 0 0 0-14 0c0 2 1 4 3 5v3h8v-3c2-1 3-3 3-5z|M9 17v2a3 3 0 0 0 6 0v-2" },
+    { id: "projection", label: "Projection", icon: "M3 3v18h18|M18 9l-5 5-4-4-3 3" },
+    { id: "scenarios", label: "Scenarios", icon: "M19 8a7 7 0 0 0-14 0c0 2 1 4 3 5v3h8v-3c2-1 3-3 3-5z|M9 17v2a3 3 0 0 0 6 0v-2" },
   ];
 
   return (
@@ -321,7 +611,8 @@ function FinanceTracker() {
         {tab === "history" && <NetWorthHistory {...{ data, persist, netWorth, totalAssets, totalLiabilities }} />}
         {tab === "cashflow" && <CashFlow {...{ data, persist, monthlyIncome, monthlyExpenses, monthlyNet }} />}
         {tab === "goals" && <Goals {...{ data, persist, monthlyNet, monthlyExpenses }} />}
-        {tab === "scenario" && <Scenario {...{ netWorth, monthlyNet, totalAssets }} />}
+        {tab === "projection" && <Projection {...{ data, persist }} />}
+        {tab === "scenarios" && <Scenarios {...{ data, persist }} />}
       </main>
     </div>
   );
@@ -498,23 +789,35 @@ function Ledger({ data, persist }) {
   const changeAsset = (id, field, val) =>
     persist({ ...data, assets: data.assets.map((a) => a.id === id ? { ...a, [field]: val } : a) });
   const addAsset = () =>
-    persist({ ...data, assets: [...data.assets, { id: "a" + Date.now(), name: "New asset", value: 0, liquid: false }] });
+    persist({ ...data, assets: [...data.assets, { id: "a" + Date.now(), name: "New asset", value: 0, liquid: false, growthRate: DEFAULT_ASSET_GROWTH }] });
   const removeAsset = (id) =>
     persist({ ...data, assets: data.assets.filter((a) => a.id !== id) });
   const reorderAssets = (next) => persist({ ...data, assets: next });
+
+  const changeLiab = (id, field, val) =>
+    persist({ ...data, liabilities: data.liabilities.map((x) => x.id === id ? { ...x, [field]: val } : x) });
+  const addLiab = () =>
+    persist({ ...data, liabilities: [...data.liabilities, { id: "l" + Date.now(), name: "New liability", value: 0, rate: 0, payment: 0 }] });
+  const removeLiab = (id) =>
+    persist({ ...data, liabilities: data.liabilities.filter((x) => x.id !== id) });
   const reorderLiabilities = (next) => persist({ ...data, liabilities: next });
-  const l = useListEditor(data, persist, "liabilities");
+
   const drag = useDragReorder(data.assets, reorderAssets);
+  const ldrag = useDragReorder(data.liabilities, reorderLiabilities);
 
   const liquidTotal = sum(data.assets.filter((a) => a.liquid));
 
+  const ASSET_COLS = "24px 1fr 110px 64px 40px 30px";
+  const LIAB_COLS = "24px 1fr 90px 50px 64px 56px 30px";
+
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 20 }}>
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(340px, 1fr))", gap: 20 }}>
       <Card title="Assets" accent={C.green}>
-        <div style={{ display: "grid", gridTemplateColumns: "24px 1fr 120px 48px 34px", padding: "0 4px 8px",
-          fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: C.muted, borderBottom: `1px solid ${C.line}` }}>
+        <div style={{ display: "grid", gridTemplateColumns: ASSET_COLS, padding: "0 4px 8px", gap: 4,
+          fontSize: 10, textTransform: "uppercase", letterSpacing: 0.5, color: C.muted, borderBottom: `1px solid ${C.line}` }}>
           <span /><span>Item</span><span style={{ textAlign: "right" }}>Value</span>
-          <span style={{ textAlign: "center" }} title="Mark as liquid / easily accessible">💧</span>
+          <span style={{ textAlign: "right" }} title="Annual growth %">Grow%</span>
+          <span style={{ textAlign: "center" }} title="Liquid / accessible">💧</span>
           <span />
         </div>
         {data.assets.map((a) => {
@@ -523,7 +826,7 @@ function Ledger({ data, persist }) {
           return (
             <div key={a.id} data-rowid={a.id} className="row-in"
               {...drag.dragProps(a.id)}
-              style={{ display: "grid", gridTemplateColumns: "24px 1fr 120px 48px 34px", alignItems: "center",
+              style={{ display: "grid", gridTemplateColumns: ASSET_COLS, alignItems: "center", gap: 4,
                 borderBottom: `1px solid ${C.line}`, borderTop: isOver ? `2px solid ${C.brass}` : "2px solid transparent",
                 opacity: isDragging ? 0.4 : 1, background: isDragging ? C.paper : "transparent" }}>
               <span {...drag.touchProps(a.id)} style={{ touchAction: "none" }}>
@@ -531,14 +834,18 @@ function Ledger({ data, persist }) {
               </span>
               <input className="cell namecell" value={a.name} onChange={(e) => changeAsset(a.id, "name", e.target.value)} />
               <input className="cell tnum" type="number" value={a.value} onChange={(e) => changeAsset(a.id, "value", e.target.value)} />
+              <input className="cell tnum" type="number" step="0.5"
+                value={a.growthRate != null ? a.growthRate : DEFAULT_ASSET_GROWTH}
+                onChange={(e) => changeAsset(a.id, "growthRate", Number(e.target.value))}
+                title="Expected annual growth %" />
               <button onClick={() => toggleLiquid(a.id)} title={a.liquid ? "Liquid — click to remove" : "Mark as liquid/accessible"}
-                style={{ background: "none", border: "none", display: "grid", placeItems: "center", fontSize: 16,
+                style={{ background: "none", border: "none", display: "grid", placeItems: "center", fontSize: 15,
                   opacity: a.liquid ? 1 : 0.25, cursor: "pointer", transition: "opacity .15s" }}>
                 💧
               </button>
               <button onClick={() => removeAsset(a.id)}
                 style={{ background: "none", border: "none", color: C.muted, display: "grid", placeItems: "center" }}>
-                <Ic d="M3 6h18|M8 6V4h8v2|M19 6l-1 14H6L5 6|M10 11v6|M14 11v6" size={15} />
+                <Ic d="M3 6h18|M8 6V4h8v2|M19 6l-1 14H6L5 6|M10 11v6|M14 11v6" size={14} />
               </button>
             </div>
           );
@@ -555,12 +862,72 @@ function Ledger({ data, persist }) {
           <span className="tnum" style={{ fontWeight: 600, color: C.moss }}>{fmt(liquidTotal)}</span>
         </div>
         <p style={{ fontSize: 12, color: C.muted, marginTop: 8, lineHeight: 1.5 }}>
-          Tap 💧 to mark accounts that are easily accessible — these can be linked to savings goals. Drag ⠿ to reorder.
+          Grow% is each account's expected annual growth, used by the Projection tab. Drag ⠿ to reorder.
         </p>
       </Card>
+
       <Card title="Liabilities" accent={C.red}>
-        <ItemTable items={data.liabilities} onChange={l.change} onAdd={l.add} onRemove={l.remove} onReorder={reorderLiabilities} valueLabel="Balance" />
+        <div style={{ display: "grid", gridTemplateColumns: LIAB_COLS, padding: "0 4px 8px", gap: 4,
+          fontSize: 10, textTransform: "uppercase", letterSpacing: 0.5, color: C.muted, borderBottom: `1px solid ${C.line}` }}>
+          <span /><span>Item</span><span style={{ textAlign: "right" }}>Balance</span>
+          <span style={{ textAlign: "right" }} title="Interest rate %">Rate%</span>
+          <span style={{ textAlign: "right" }} title="Months left (from your statement)">Mo.left</span>
+          <span style={{ textAlign: "right" }} title="Monthly payment">Pay/mo</span>
+          <span />
+        </div>
+        {data.liabilities.map((x) => {
+          const isOver = ldrag.overId === x.id && ldrag.dragId !== x.id;
+          const isDragging = ldrag.dragId === x.id;
+          const mr = Number(x.monthsRemaining) || 0;
+          // computed P&I payment when months-left drives it
+          const val = Number(x.value) || 0, rt = Number(x.rate) || 0;
+          let computedPay = null;
+          if (mr > 0 && val > 0) {
+            const im = rt / 100 / 12;
+            computedPay = im > 0 ? (val * im) / (1 - Math.pow(1 + im, -mr)) : val / mr;
+          }
+          return (
+            <div key={x.id} data-rowid={x.id} className="row-in"
+              {...ldrag.dragProps(x.id)}
+              style={{ display: "grid", gridTemplateColumns: LIAB_COLS, alignItems: "center", gap: 4,
+                borderBottom: `1px solid ${C.line}`, borderTop: isOver ? `2px solid ${C.brass}` : "2px solid transparent",
+                opacity: isDragging ? 0.4 : 1, background: isDragging ? C.paper : "transparent" }}>
+              <span {...ldrag.touchProps(x.id)} style={{ touchAction: "none" }}>
+                <DragHandle active={isDragging} />
+              </span>
+              <input className="cell namecell" value={x.name} onChange={(e) => changeLiab(x.id, "name", e.target.value)} />
+              <input className="cell tnum" type="number" value={x.value} onChange={(e) => changeLiab(x.id, "value", e.target.value)} />
+              <input className="cell tnum" type="number" step="0.1" value={x.rate != null ? x.rate : 0}
+                onChange={(e) => changeLiab(x.id, "rate", Number(e.target.value))} title="Interest rate %" />
+              <input className="cell tnum" type="number" value={x.monthsRemaining != null ? x.monthsRemaining : ""}
+                placeholder="—"
+                onChange={(e) => changeLiab(x.id, "monthsRemaining", e.target.value === "" ? "" : Number(e.target.value))}
+                title="Months left from your loan statement (overrides payment)" />
+              {computedPay != null ? (
+                <span className="tnum" title="Auto-calculated from months left"
+                  style={{ textAlign: "right", fontSize: 13, color: C.moss, fontWeight: 600, paddingRight: 8 }}>
+                  {fmt(computedPay)}
+                </span>
+              ) : (
+                <input className="cell tnum" type="number" value={x.payment != null ? x.payment : 0}
+                  onChange={(e) => changeLiab(x.id, "payment", Number(e.target.value))} title="Monthly payment (P&I only)" />
+              )}
+              <button onClick={() => removeLiab(x.id)}
+                style={{ background: "none", border: "none", color: C.muted, display: "grid", placeItems: "center" }}>
+                <Ic d="M3 6h18|M8 6V4h8v2|M19 6l-1 14H6L5 6|M10 11v6|M14 11v6" size={14} />
+              </button>
+            </div>
+          );
+        })}
+        <button onClick={addLiab}
+          style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 6, background: "none",
+            border: `1px dashed ${C.moss}`, color: C.forest, padding: "8px 14px", borderRadius: 8, fontSize: 13 }}>
+          <Ic d="M12 5v14|M5 12h14" size={14} /> Add row
+        </button>
         <Total label="Total liabilities" value={sum(data.liabilities)} color={C.red} />
+        <p style={{ fontSize: 12, color: C.muted, marginTop: 8, lineHeight: 1.5 }}>
+          Enter <strong>Months left</strong> from your loan statement for the most accurate payoff date — the payment is then calculated for you (shown in green). Leave it blank to instead enter your own P&amp;I payment and have the payoff date derived from it.
+        </p>
       </Card>
     </div>
   );
@@ -1096,55 +1463,711 @@ function HistoryChart({ history, labelMonth }) {
   );
 }
 
-// ---- Scenario tab ----
-function Scenario({ netWorth, monthlyNet, totalAssets }) {
-  const [monthlySave, setMonthlySave] = useState(Math.max(0, monthlyNet));
-  const [years, setYears] = useState(10);
-  const [rate, setRate] = useState(6);
+// ---- Scenarios tab (Pass 2) ----
+function monthsFromNow(ym) {
+  if (!ym) return 0;
+  const [y, m] = ym.split("-").map(Number);
+  const now = new Date(); now.setDate(1);
+  return Math.max(0, (y - now.getFullYear()) * 12 + (m - 1 - now.getMonth()));
+}
+function ymFromMonths(offset) {
+  const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() + (offset || 0));
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
 
-  const months = years * 12;
-  const r = rate / 100 / 12;
-  // Future value of invested assets + monthly contributions
-  const fvAssets = totalAssets * Math.pow(1 + r, months);
-  const fvContrib = r > 0 ? monthlySave * ((Math.pow(1 + r, months) - 1) / r) : monthlySave * months;
-  const projected = fvAssets + fvContrib;
-  const contributed = monthlySave * months;
-  const growth = projected - totalAssets - contributed;
+const EVENT_TYPES = {
+  child: { label: "👶 New child", color: "#7d6b8a" },
+  home: { label: "🏠 Home purchase", color: "#5b7a8c" },
+  income: { label: "💼 Income change", color: "#3f6b4a" },
+  onetime: { label: "💵 One-time expense / windfall", color: "#b08a3e" },
+  expense: { label: "🔁 Recurring expense change", color: "#9e4634" },
+};
 
-  const Slider = ({ label, value, set, min, max, step, suffix }) => (
-    <div style={{ marginBottom: 22 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-        <span style={{ fontSize: 14, color: C.ink }}>{label}</span>
-        <span className="serif tnum" style={{ fontWeight: 700, color: C.forest }}>{suffix === "$" ? fmt(value) : `${value}${suffix}`}</span>
-      </div>
-      <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => set(Number(e.target.value))}
-        style={{ width: "100%", accentColor: C.brass }} />
-    </div>
-  );
+function Scenarios({ data, persist }) {
+  const scenarios = data.scenarios || [];
+  const [activeId, setActiveId] = useState(scenarios[0]?.id || null);
+  const [compareId, setCompareId] = useState(null);
+
+  const active = scenarios.find((s) => s.id === activeId) || null;
+  const saveScenarios = (next) => persist({ ...data, scenarios: next });
+
+  const addScenario = () => {
+    const s = { id: "s" + Date.now(), name: "New scenario", events: [] };
+    saveScenarios([...scenarios, s]);
+    setActiveId(s.id);
+  };
+  const removeScenario = (id) => {
+    const next = scenarios.filter((s) => s.id !== id);
+    saveScenarios(next);
+    if (activeId === id) setActiveId(next[0]?.id || null);
+    if (compareId === id) setCompareId(null);
+  };
+  const updateScenario = (id, updates) =>
+    saveScenarios(scenarios.map((s) => s.id === id ? { ...s, ...updates } : s));
+
+  const addEvent = (type) => {
+    if (!active) return;
+    const base = { id: "ev" + Date.now(), type, startMonth: 12, label: EVENT_TYPES[type].label.replace(/^\S+\s/, "") };
+    const defaults = {
+      child: { monthlyExpense: 1400, leaveIncomeDelta: -2000, leaveEndMonth: 15, oneTimeCost: 2000 },
+      home: { downPayment: 50000, closingCosts: 10000, mortgageRate: 6.5, termYears: 30, newAssetValue: 400000, appreciation: 3, housingCostDelta: 0 },
+      income: { monthlyDelta: 1000, endMonth: null },
+      onetime: { amount: -10000 },
+      expense: { monthlyDelta: 300, endMonth: null },
+    };
+    updateScenario(active.id, { events: [...(active.events || []), { ...base, ...defaults[type] }] });
+  };
+  const updateEvent = (evId, updates) =>
+    updateScenario(active.id, { events: active.events.map((e) => e.id === evId ? { ...e, ...updates } : e) });
+  const removeEvent = (evId) =>
+    updateScenario(active.id, { events: active.events.filter((e) => e.id !== evId) });
+
+  const baseline = React.useMemo(() => runProjection(data), [data]);
+  const activeProj = React.useMemo(() => active ? runProjection(data, { events: active.events || [] }) : null, [data, active]);
+  const compareScenario = scenarios.find((s) => s.id === compareId) || null;
+  const compareProj = React.useMemo(() => compareScenario ? runProjection(data, { events: compareScenario.events || [] }) : baseline, [data, compareScenario, baseline]);
+
+  const horizonYears = (data.assumptions || {}).horizonYears || 20;
+
+  if (scenarios.length === 0) {
+    return (
+      <Card title="Build your first scenario" accent={C.brass}>
+        <p style={{ color: C.muted, fontSize: 14, lineHeight: 1.6, marginBottom: 16 }}>
+          A scenario stacks life events — a second child, a new house, a raise — on top of your baseline projection, so you can see how they'd reshape your net worth and cash flow. Create one to start.
+        </p>
+        <button onClick={addScenario} style={{ display: "flex", alignItems: "center", gap: 6, background: C.forest, border: "none", color: C.paper, padding: "10px 18px", borderRadius: 8, fontSize: 14 }}>
+          <Ic d="M12 5v14|M5 12h14" size={16} /> New scenario
+        </button>
+      </Card>
+    );
+  }
 
   return (
     <>
-      <Card title="What if we keep this up?">
-        <p style={{ color: C.muted, fontSize: 14, marginTop: 0, lineHeight: 1.6 }}>
-          Project how your invested assets grow over time. Adjust how much you set aside monthly, the time horizon, and an assumed annual return.
-        </p>
-        <Slider label="Saved & invested per month" value={monthlySave} set={setMonthlySave} min={0} max={10000} step={100} suffix="$" />
-        <Slider label="Time horizon" value={years} set={setYears} min={1} max={40} step={1} suffix=" yrs" />
-        <Slider label="Assumed annual return" value={rate} set={setRate} min={0} max={12} step={0.5} suffix="%" />
+      <Card title="Scenarios" accent={C.brass}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+          {scenarios.map((s) => (
+            <button key={s.id} onClick={() => setActiveId(s.id)}
+              style={{ padding: "8px 14px", borderRadius: 20, fontSize: 13, border: `1px solid ${activeId === s.id ? C.forest : C.line}`,
+                background: activeId === s.id ? C.forest : C.paper, color: activeId === s.id ? C.paper : C.muted, fontWeight: activeId === s.id ? 700 : 400 }}>
+              {s.name}
+            </button>
+          ))}
+          <button onClick={addScenario} style={{ padding: "8px 14px", borderRadius: 20, fontSize: 13, border: `1px dashed ${C.moss}`, background: "none", color: C.forest, display: "flex", alignItems: "center", gap: 4 }}>
+            <Ic d="M12 5v14|M5 12h14" size={14} /> New
+          </button>
+        </div>
       </Card>
 
-      <Card title={`Projected in ${years} years`} accent={C.brass}>
-        <div className="serif tnum" style={{ fontSize: 40, fontWeight: 700, color: C.forest }}>{fmt(projected)}</div>
-        <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginTop: 18 }}>
-          <MiniStat label="Starting assets" value={fmt(totalAssets)} />
-          <MiniStat label="You contribute" value={fmt(contributed)} />
-          <MiniStat label="Growth earned" value={fmt(growth)} color={C.brass} />
+      {active && (
+        <>
+          <Card title="Edit scenario" accent={C.forest}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16 }}>
+              <input className="cell namecell serif" style={{ fontSize: 18, flex: 1, border: `1px solid ${C.line}`, borderRadius: 6, padding: "6px 8px" }}
+                value={active.name} onChange={(e) => updateScenario(active.id, { name: e.target.value })} />
+              <button onClick={() => removeScenario(active.id)} title="Delete scenario"
+                style={{ background: "none", border: "none", color: C.muted, padding: 6 }}><Ic d="M3 6h18|M8 6V4h8v2|M19 6l-1 14H6L5 6|M10 11v6|M14 11v6" size={16} /></button>
+            </div>
+
+            {(active.events || []).length === 0 && (
+              <p style={{ fontSize: 13, color: C.muted, marginBottom: 14 }}>No events yet. Add one below — you can stack as many as you like.</p>
+            )}
+            {(active.events || []).map((ev) => (
+              <EventEditor key={ev.id} ev={ev} onChange={(u) => updateEvent(ev.id, u)} onRemove={() => removeEvent(ev.id)} />
+            ))}
+
+            <div style={{ marginTop: 14 }}>
+              <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 1, color: C.muted, marginBottom: 8 }}>Add an event</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {Object.keys(EVENT_TYPES).map((t) => (
+                  <button key={t} onClick={() => addEvent(t)}
+                    style={{ padding: "7px 12px", borderRadius: 8, fontSize: 13, border: `1px solid ${C.line}`, background: C.paper, color: C.ink }}>
+                    {EVENT_TYPES[t].label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </Card>
+
+          <Card title="Compare" accent={C.moss}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 14 }}>
+              <span style={{ fontSize: 13, color: C.muted }}>Compare</span>
+              <strong style={{ fontSize: 13, color: C.forest }}>{active.name}</strong>
+              <span style={{ fontSize: 13, color: C.muted }}>against</span>
+              <select value={compareId || ""} onChange={(e) => setCompareId(e.target.value || null)}
+                style={{ padding: "7px 10px", borderRadius: 8, border: `1px solid ${C.line}`, background: "#fff", font: "inherit", color: C.ink }}>
+                <option value="">Baseline (no changes)</option>
+                {scenarios.filter((s) => s.id !== active.id).map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
+
+            <CompareChart horizonYears={horizonYears}
+              seriesA={activeProj.series} labelA={active.name}
+              seriesB={compareProj.series} labelB={compareScenario ? compareScenario.name : "Baseline"} />
+
+            <ComparisonDeltas horizonYears={horizonYears}
+              seriesA={activeProj.series} labelA={active.name}
+              seriesB={compareProj.series} labelB={compareScenario ? compareScenario.name : "Baseline"} />
+          </Card>
+
+          <ShortTermView scenarioProj={activeProj} baselineProj={baseline} scenarioName={active.name} />
+        </>
+      )}
+    </>
+  );
+}
+
+// Short-term feasibility: cash-flow runway + goal-delay vs baseline + near-term surplus
+function ShortTermView({ scenarioProj, baselineProj, scenarioName }) {
+  const WINDOW = 36; // months to examine for near-term feasibility
+  const series = scenarioProj.series;
+  const n = Math.min(WINDOW, series.length - 1);
+
+  // Find the worst stretch of negative surplus and whether liquid savings can cover it.
+  // Approximate liquid runway: cumulative negative surplus vs. starting liquid assets.
+  const startLiquidGuess = series[0].assets > 0 ? series[0].assets : 0;
+  let firstNegative = -1, worstSurplus = Infinity, cumulativeShortfall = 0, monthsNegative = 0;
+  for (let i = 0; i <= n; i++) {
+    const s = series[i].surplus;
+    if (s < 0) {
+      if (firstNegative < 0) firstNegative = i;
+      monthsNegative++;
+      cumulativeShortfall += -s;
+      if (s < worstSurplus) worstSurplus = s;
+    }
+  }
+  const anyNegative = firstNegative >= 0;
+
+  // Tier the feasibility
+  let tier, tierColor, tierMsg;
+  if (!anyNegative) {
+    tier = "Comfortably feasible"; tierColor = C.green;
+    tierMsg = "Your monthly surplus stays positive throughout the near term — this scenario fits within your cash flow.";
+  } else if (cumulativeShortfall <= startLiquidGuess) {
+    tier = "Tight but doable"; tierColor = C.brass;
+    const runwayMonths = worstSurplus < 0 ? Math.floor(startLiquidGuess / -worstSurplus) : 0;
+    tierMsg = `Surplus dips negative for ${monthsNegative} month${monthsNegative !== 1 ? "s" : ""}. Your liquid savings can absorb the cumulative shortfall of ${fmt(cumulativeShortfall)} — roughly ${runwayMonths} month${runwayMonths !== 1 ? "s" : ""} of runway at the worst monthly gap.`;
+  } else {
+    tier = "Not feasible as-is"; tierColor = C.red;
+    tierMsg = `Surplus goes negative and the cumulative shortfall of ${fmt(cumulativeShortfall)} would exceed your liquid savings of about ${fmt(startLiquidGuess)}. You'd need to cut costs, delay the event, or add income to make this work.`;
+  }
+
+  // Goal delays vs baseline
+  const baseFunding = {};
+  baselineProj.goalFunding.forEach((g) => { baseFunding[g.id] = g.fundedMonth; });
+  const delays = scenarioProj.goalFunding.map((g) => {
+    const baseM = baseFunding[g.id];
+    const scenM = g.fundedMonth;
+    let delta = null;
+    if (baseM != null && scenM != null) delta = scenM - baseM;
+    return { ...g, baseM, scenM, delta };
+  });
+
+  const monthToLabel = (m) => {
+    if (m == null) return "not within horizon";
+    const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() + m);
+    return d.toLocaleDateString("en-US", { month: "short", year: "numeric" });
+  };
+
+  return (
+    <Card title="Short-term feasibility" accent={tierColor}>
+      {/* feasibility verdict */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+        <span style={{ width: 12, height: 12, borderRadius: "50%", background: tierColor, flexShrink: 0 }} />
+        <span className="serif" style={{ fontSize: 18, fontWeight: 700, color: tierColor }}>{tier}</span>
+      </div>
+      <p style={{ fontSize: 13, color: C.muted, lineHeight: 1.6, marginTop: 0, marginBottom: 18 }}>{tierMsg}</p>
+
+      {/* near-term surplus bars */}
+      <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 1, color: C.muted, marginBottom: 10 }}>
+        Monthly surplus — next {n} months
+      </div>
+      <SurplusBars series={series} months={n} />
+
+      {/* goal delays */}
+      <div style={{ marginTop: 20, paddingTop: 16, borderTop: `1px dashed ${C.line}` }}>
+        <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 1, color: C.muted, marginBottom: 10 }}>
+          Goal timing vs. baseline
         </div>
-        <p style={{ fontSize: 12, color: C.muted, marginTop: 18, marginBottom: 0, lineHeight: 1.5 }}>
-          A simplified projection assuming steady contributions and a constant return, compounded monthly. Real markets vary year to year — treat this as a directional estimate, not a guarantee.
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 360 }}>
+            <thead>
+              <tr style={{ borderBottom: `2px solid ${C.ink}` }}>
+                <th style={{ textAlign: "left", padding: "6px 8px", fontSize: 11, textTransform: "uppercase", color: C.muted }}>Goal</th>
+                <th style={{ textAlign: "right", padding: "6px 8px", fontSize: 11, textTransform: "uppercase", color: C.muted }}>Baseline</th>
+                <th style={{ textAlign: "right", padding: "6px 8px", fontSize: 11, textTransform: "uppercase", color: C.muted }}>{scenarioName}</th>
+                <th style={{ textAlign: "right", padding: "6px 8px", fontSize: 11, textTransform: "uppercase", color: C.muted }}>Delay</th>
+              </tr>
+            </thead>
+            <tbody>
+              {delays.map((g) => (
+                <tr key={g.id} style={{ borderBottom: `1px solid ${C.line}` }}>
+                  <td style={{ padding: "7px 8px" }}>{g.name}{g.isEmergencyFund ? " 🛡" : ""}</td>
+                  <td className="tnum" style={{ textAlign: "right", padding: "7px 8px", color: C.muted }}>{monthToLabel(g.baseM)}</td>
+                  <td className="tnum" style={{ textAlign: "right", padding: "7px 8px" }}>{monthToLabel(g.scenM)}</td>
+                  <td className="tnum" style={{ textAlign: "right", padding: "7px 8px", fontWeight: 700, color: g.delta == null ? C.muted : g.delta > 0 ? C.red : g.delta < 0 ? C.green : C.muted }}>
+                    {g.delta == null ? "—" : g.delta === 0 ? "no change" : g.delta > 0 ? `+${g.delta} mo` : `${g.delta} mo`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <p style={{ fontSize: 12, color: C.muted, marginTop: 10, marginBottom: 0, lineHeight: 1.5 }}>
+          A positive delay means this scenario pushes the goal later. "Not within horizon" means the goal isn't funded inside your projection window in that path.
+        </p>
+      </div>
+    </Card>
+  );
+}
+
+function SurplusBars({ series, months }) {
+  const W = 680, H = 140, pL = 50, pR = 10, pT = 10, pB = 22;
+  const vals = [];
+  for (let i = 0; i <= months; i++) vals.push(series[i].surplus);
+  const maxV = Math.max(...vals, 0), minV = Math.min(...vals, 0);
+  const range = (maxV - minV) || 1;
+  const bw = (W - pL - pR) / (months + 1);
+  const zeroY = pT + (maxV / range) * (H - pT - pB);
+  const barH = (v) => Math.abs(v) / range * (H - pT - pB);
+
+  return (
+    <div style={{ width: "100%", overflowX: "auto" }}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", minWidth: 360, display: "block" }}>
+        <line x1={pL} y1={zeroY} x2={W - pR} y2={zeroY} stroke={C.muted} strokeWidth="1" />
+        <text x={pL - 6} y={zeroY + 3} textAnchor="end" fontSize="9" fill={C.muted} fontFamily="Georgia, serif">$0</text>
+        <text x={pL - 6} y={pT + 6} textAnchor="end" fontSize="9" fill={C.muted} fontFamily="Georgia, serif">{fmt(maxV)}</text>
+        {minV < 0 && <text x={pL - 6} y={H - pB} textAnchor="end" fontSize="9" fill={C.red} fontFamily="Georgia, serif">{fmt(minV)}</text>}
+        {vals.map((v, i) => {
+          const x = pL + i * bw;
+          const h = barH(v);
+          const y = v >= 0 ? zeroY - h : zeroY;
+          return <rect key={i} x={x} y={y} width={Math.max(1, bw - 1.5)} height={Math.max(0.5, h)} fill={v >= 0 ? C.moss : C.red} rx="1" />;
+        })}
+        {[0, 12, 24, 36].filter((m) => m <= months).map((m) => (
+          <text key={m} x={pL + m * bw} y={H - 6} textAnchor="middle" fontSize="9" fill={C.muted} fontFamily="Georgia, serif">{m === 0 ? "now" : `${m}mo`}</text>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+
+// Stable, module-level inputs (defining these inside EventEditor would remount
+// them on every keystroke and drop keyboard focus).
+function EvNum({ label, field, step, ev, onChange }) {
+  return (
+    <label style={{ fontSize: 12, color: C.muted, display: "block" }}>
+      {label}
+      <input type="number" inputMode="decimal" step={step || 1} value={ev[field] != null ? ev[field] : ""}
+        onChange={(e) => onChange({ [field]: e.target.value === "" ? null : Number(e.target.value) })}
+        style={{ border: `1px solid ${C.line}`, borderRadius: 6, marginTop: 3, width: "100%", padding: "9px 10px", font: "inherit", fontSize: 15, color: C.ink, background: "#fff", textAlign: "left" }} />
+    </label>
+  );
+}
+function EvDate({ label, field, ev, onChange }) {
+  return (
+    <label style={{ fontSize: 12, color: C.muted, display: "block" }}>
+      {label}
+      <input type="month" value={ymFromMonths(ev[field])}
+        onChange={(e) => onChange({ [field]: monthsFromNow(e.target.value) })}
+        style={{ border: `1px solid ${C.line}`, borderRadius: 6, marginTop: 3, width: "100%", padding: "7px 8px", font: "inherit", color: C.ink, background: "#fff" }} />
+    </label>
+  );
+}
+
+// Read-only display of the calculated mortgage amount + monthly payment
+function DerivedMortgage({ ev }) {
+  const m = deriveMortgage(ev);
+  return (
+    <div style={{ gridColumn: "1 / -1", background: C.paper, borderRadius: 8, padding: "10px 12px", fontSize: 13, color: C.muted }}>
+      Calculated: mortgage of <strong className="tnum" style={{ color: C.forest }}>{fmt(m.amount)}</strong>
+      {" "}(home − down payment), paid over {m.term} years at a monthly payment of{" "}
+      <strong className="tnum" style={{ color: C.moss }}>{fmt(m.payment)}</strong>.
+    </div>
+  );
+}
+
+function EventEditor({ ev, onChange, onRemove }) {
+  const meta = EVENT_TYPES[ev.type] || { label: ev.type, color: C.muted };
+
+  return (
+    <div style={{ border: `1px solid ${C.line}`, borderLeft: `4px solid ${meta.color}`, borderRadius: 10, padding: 14, marginBottom: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+        <span style={{ fontSize: 14, fontWeight: 600, color: C.ink, flex: 1 }}>{meta.label}</span>
+        <button onClick={onRemove} style={{ background: "none", border: "none", color: C.muted, padding: 4 }}><Ic d="M3 6h18|M8 6V4h8v2|M19 6l-1 14H6L5 6|M10 11v6|M14 11v6" size={14} /></button>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12 }}>
+        <EvDate label="Starts" field="startMonth" ev={ev} onChange={onChange} />
+        {ev.type === "child" && <>
+          <EvNum label="Monthly cost (childcare etc.)" field="monthlyExpense" ev={ev} onChange={onChange} />
+          <EvNum label="Income change during leave" field="leaveIncomeDelta" ev={ev} onChange={onChange} />
+          <EvDate label="Leave ends" field="leaveEndMonth" ev={ev} onChange={onChange} />
+          <EvNum label="One-time upfront cost" field="oneTimeCost" ev={ev} onChange={onChange} />
+        </>}
+        {ev.type === "home" && <>
+          <EvNum label="Home value" field="newAssetValue" ev={ev} onChange={onChange} />
+          <EvNum label="Down payment" field="downPayment" ev={ev} onChange={onChange} />
+          <EvNum label="Closing costs" field="closingCosts" ev={ev} onChange={onChange} />
+          <EvNum label="Mortgage rate %" field="mortgageRate" step={0.1} ev={ev} onChange={onChange} />
+          <EvNum label="Loan term (years)" field="termYears" ev={ev} onChange={onChange} />
+          <EvNum label="Appreciation %" field="appreciation" step={0.5} ev={ev} onChange={onChange} />
+          <EvNum label="Housing cost change/mo" field="housingCostDelta" ev={ev} onChange={onChange} />
+          <DerivedMortgage ev={ev} />
+        </>}
+        {ev.type === "income" && <>
+          <EvNum label="Monthly change (+/−)" field="monthlyDelta" ev={ev} onChange={onChange} />
+          <EvDate label="Ends (optional)" field="endMonth" ev={ev} onChange={onChange} />
+        </>}
+        {ev.type === "onetime" && <>
+          <EvNum label="Amount (− expense, + windfall)" field="amount" ev={ev} onChange={onChange} />
+        </>}
+        {ev.type === "expense" && <>
+          <EvNum label="Monthly change (+/−)" field="monthlyDelta" ev={ev} onChange={onChange} />
+          <EvDate label="Ends (optional)" field="endMonth" ev={ev} onChange={onChange} />
+        </>}
+      </div>
+    </div>
+  );
+}
+
+function CompareChart({ seriesA, labelA, seriesB, labelB, horizonYears }) {
+  if (!seriesA || !seriesB) return null;
+  const W = 680, H = 280, pL = 70, pR = 16, pT = 16, pB = 36;
+  const n = Math.min(seriesA.length, seriesB.length);
+  const all = [...seriesA.slice(0, n).map((s) => s.netWorth), ...seriesB.slice(0, n).map((s) => s.netWorth)];
+  const maxV = Math.max(...all, 0), minV = Math.min(...all, 0), range = maxV - minV || 1;
+  const cx = (i) => pL + (i / (n - 1)) * (W - pL - pR);
+  const cy = (v) => pT + (1 - (v - minV) / range) * (H - pT - pB);
+  const path = (s) => s.slice(0, n).map((p, i) => `${i === 0 ? "M" : "L"} ${cx(i)} ${cy(p.netWorth)}`).join(" ");
+  const gridVals = [minV, minV + range / 2, maxV];
+  const yearTicks = []; for (let y = 0; y <= horizonYears; y += Math.max(1, Math.ceil(horizonYears / 6))) yearTicks.push(y);
+
+  return (
+    <div style={{ width: "100%", overflowX: "auto" }}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", minWidth: 320, display: "block" }}>
+        {gridVals.map((gv, i) => (
+          <g key={i}>
+            <line x1={pL} y1={cy(gv)} x2={W - pR} y2={cy(gv)} stroke={C.line} strokeWidth="1" />
+            <text x={pL - 6} y={cy(gv) + 4} textAnchor="end" fontSize="10" fill={C.muted} fontFamily="Georgia, serif">{fmt(gv)}</text>
+          </g>
+        ))}
+        {yearTicks.map((y) => { const i = Math.min(n - 1, y * 12); return <text key={y} x={cx(i)} y={H - pB + 16} textAnchor="middle" fontSize="10" fill={C.muted} fontFamily="Georgia, serif">{y === 0 ? "now" : `${y}y`}</text>; })}
+        <path d={path(seriesB)} fill="none" stroke={C.muted} strokeWidth="2" strokeDasharray="5 4" />
+        <path d={path(seriesA)} fill="none" stroke={C.forest} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
+      </svg>
+      <div style={{ display: "flex", gap: 16, marginTop: 10, flexWrap: "wrap" }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.muted }}>
+          <span style={{ width: 18, height: 3, background: C.forest, display: "inline-block" }} /> {labelA}
+        </span>
+        <span style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.muted }}>
+          <span style={{ width: 18, height: 0, borderTop: `3px dashed ${C.muted}`, display: "inline-block" }} /> {labelB}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function ComparisonDeltas({ seriesA, labelA, seriesB, labelB, horizonYears }) {
+  const years = [5, 10, 20, 30].filter((y) => y <= horizonYears);
+  const rows = years.map((y) => {
+    const i = Math.min(seriesA.length - 1, seriesB.length - 1, y * 12);
+    const av = seriesA[i].netWorth, bv = seriesB[i].netWorth;
+    return { y, av, bv, delta: av - bv };
+  });
+  return (
+    <div style={{ marginTop: 18, paddingTop: 14, borderTop: `1px dashed ${C.line}` }}>
+      <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 1, color: C.muted, marginBottom: 10 }}>Net worth difference ({labelA} − {labelB})</div>
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 320 }}>
+          <thead>
+            <tr style={{ borderBottom: `2px solid ${C.ink}` }}>
+              <th style={{ textAlign: "left", padding: "6px 8px", fontSize: 11, textTransform: "uppercase", color: C.muted }}>At</th>
+              <th style={{ textAlign: "right", padding: "6px 8px", fontSize: 11, textTransform: "uppercase", color: C.muted }}>{labelA}</th>
+              <th style={{ textAlign: "right", padding: "6px 8px", fontSize: 11, textTransform: "uppercase", color: C.muted }}>{labelB}</th>
+              <th style={{ textAlign: "right", padding: "6px 8px", fontSize: 11, textTransform: "uppercase", color: C.muted }}>Diff</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.y} style={{ borderBottom: `1px solid ${C.line}` }}>
+                <td style={{ padding: "7px 8px" }}>{r.y} yrs</td>
+                <td className="tnum" style={{ textAlign: "right", padding: "7px 8px" }}>{fmt(r.av)}</td>
+                <td className="tnum" style={{ textAlign: "right", padding: "7px 8px", color: C.muted }}>{fmt(r.bv)}</td>
+                <td className="tnum" style={{ textAlign: "right", padding: "7px 8px", fontWeight: 700, color: r.delta >= 0 ? C.green : C.red }}>{fmtSigned(r.delta)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// Module-level so it doesn't remount on each render
+function AssumptionSlider({ label, field, value, min, max, step, suffix, setA }) {
+  return (
+    <div style={{ marginBottom: 18 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+        <span style={{ fontSize: 14, color: C.ink }}>{label}</span>
+        <span className="serif tnum" style={{ fontWeight: 700, color: C.forest }}>{suffix === "$" ? fmt(value) : `${value}${suffix}`}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={(e) => setA(field, Number(e.target.value))} style={{ width: "100%", accentColor: C.brass }} />
+    </div>
+  );
+}
+
+// ---- Projection tab ----
+function Projection({ data, persist }) {
+  const a = data.assumptions || {};
+  const setA = (field, val) =>
+    persist({ ...data, assumptions: { ...a, [field]: val } });
+
+  const horizonYears = a.horizonYears || 20;
+  const { series, milestones, breakdown, overflowId } = React.useMemo(() => runProjection(data), [data]);
+
+  const start = series[0];
+  const end = series[series.length - 1];
+  const startNW = start ? start.netWorth : 0;
+  const endNW = end ? end.netWorth : 0;
+  const growthTotal = endNW - startNW;
+
+  // Totals for contributions vs growth across all assets
+  const totalContrib = breakdown.reduce((t, b) => t + b.contrib, 0);
+  const totalGrowth = breakdown.reduce((t, b) => t + b.growth, 0);
+  const totalStart = breakdown.reduce((t, b) => t + b.start, 0);
+
+  const checkpointYears = [5, 10, 20, 30].filter((y) => y <= horizonYears);
+  // per-asset values at each checkpoint
+  const assetNames = (start?.byAsset || []).map((x) => ({ id: x.id, name: x.name }));
+  const checkpointRows = checkpointYears.map((y) => {
+    const pt = series[Math.min(series.length - 1, y * 12)];
+    return { y, byAsset: pt ? pt.byAsset : [], liabilities: pt ? pt.liabilities : 0, nw: pt ? pt.netWorth : 0, efBalance: pt ? (pt.efBalance || 0) : 0, efHolderId: pt ? pt.efHolderId : null };
+  });
+
+  // Emergency fund holder + helper to show an asset's FREE balance (EF carved out)
+  const efHolderId = start?.efHolderId || null;
+  const hasEF = (start?.efBalance || 0) > 0 || checkpointRows.some((c) => c.efBalance > 0);
+  const freeAssetValue = (pt, assetId) => {
+    const raw = (pt.byAsset.find((x) => x.id === assetId) || {}).value || 0;
+    if (pt.efHolderId === assetId) return Math.max(0, raw - (pt.efBalance || 0));
+    return raw;
+  };
+  const startPoint = start || { byAsset: [], efBalance: 0, efHolderId: null };
+
+  const overflowName = (assetNames.find((x) => x.id === overflowId) || {}).name || "—";
+
+  // palette for asset bands
+  const bandColors = [C.forest, C.brass, C.moss, C.brassLight, "#7d6b8a", "#9e4634", "#5b7a8c", "#c08a5a"];
+
+  return (
+    <>
+      <Card title="Your projected trajectory" accent={C.forest}>
+        <p style={{ color: C.muted, fontSize: 13, marginTop: 0, lineHeight: 1.6, marginBottom: 16 }}>
+          Where your net worth heads if nothing major changes. Each band is an asset growing at its own rate — so you can see not just the total, but how its make-up shifts (and how much is locked in illiquid things like home equity).
+        </p>
+        <StackedAreaChart series={series} horizonYears={horizonYears} assetNames={assetNames} colors={bandColors} milestones={milestones} />
+        {/* legend */}
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: 14 }}>
+          {assetNames.map((an, idx) => (
+            <span key={an.id} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: C.muted }}>
+              <span style={{ width: 12, height: 12, borderRadius: 3, background: bandColors[idx % bandColors.length], display: "inline-block" }} />
+              {an.name}
+            </span>
+          ))}
+        </div>
+      </Card>
+
+      <Card title={`Net worth in ${horizonYears} years`} accent={C.brass}>
+        <div className="serif tnum" style={{ fontSize: 38, fontWeight: 700, color: C.forest }}>{fmt(endNW)}</div>
+        <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginTop: 16 }}>
+          <MiniStat label="Today" value={fmt(startNW)} />
+          <MiniStat label="Total change" value={fmtSigned(growthTotal)} color={growthTotal >= 0 ? C.green : C.red} />
+        </div>
+        {/* contributions vs growth */}
+        <div style={{ marginTop: 18, paddingTop: 14, borderTop: `1px dashed ${C.line}` }}>
+          <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 1, color: C.muted, marginBottom: 10 }}>What built that net worth</div>
+          <ContribGrowthBar start={totalStart} contrib={totalContrib} growth={totalGrowth} />
+          <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginTop: 12 }}>
+            <MiniStat label="Starting assets" value={fmt(totalStart)} />
+            <MiniStat label="You contributed" value={fmt(totalContrib)} color={C.moss} />
+            <MiniStat label="Market growth" value={fmt(totalGrowth)} color={C.brass} />
+          </div>
+        </div>
+      </Card>
+
+      {/* Per-asset checkpoint breakdown */}
+      <Card title="Breakdown by asset" accent={C.moss}>
+        <p style={{ color: C.muted, fontSize: 13, marginTop: 0, lineHeight: 1.6, marginBottom: 14 }}>
+          Each asset at future checkpoints — so a big total doesn't hide that much of it may be illiquid or lower-risk. The account holding your emergency fund shows its "free" (spendable) balance, with the emergency-fund portion broken out just beneath it, since the fund grows over time to keep pace with your expenses.
+        </p>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 360 }}>
+            <thead>
+              <tr style={{ borderBottom: `2px solid ${C.ink}` }}>
+                <th style={{ textAlign: "left", padding: "6px 8px", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, color: C.muted }}>Asset</th>
+                <th style={{ textAlign: "right", padding: "6px 8px", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, color: C.muted }}>Now</th>
+                {checkpointRows.map((c) => (
+                  <th key={c.y} style={{ textAlign: "right", padding: "6px 8px", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, color: C.muted }}>{c.y}y</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {assetNames.map((an, idx) => (
+                <React.Fragment key={an.id}>
+                  <tr style={{ borderBottom: `1px solid ${C.line}` }}>
+                    <td style={{ padding: "7px 8px", display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ width: 10, height: 10, borderRadius: 2, background: bandColors[idx % bandColors.length], display: "inline-block", flexShrink: 0 }} />
+                      {an.name}{hasEF && efHolderId === an.id ? <span style={{ fontSize: 11, color: C.muted }}> (free)</span> : null}
+                    </td>
+                    <td className="tnum" style={{ textAlign: "right", padding: "7px 8px", color: C.muted }}>
+                      {fmt(freeAssetValue(startPoint, an.id))}
+                    </td>
+                    {checkpointRows.map((c) => (
+                      <td key={c.y} className="tnum" style={{ textAlign: "right", padding: "7px 8px" }}>
+                        {fmt(freeAssetValue(c, an.id))}
+                      </td>
+                    ))}
+                  </tr>
+                  {/* emergency fund row, shown right under the account that holds it */}
+                  {hasEF && efHolderId === an.id && (
+                    <tr style={{ borderBottom: `1px solid ${C.line}` }}>
+                      <td style={{ padding: "7px 8px 7px 24px", display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{ fontSize: 12 }}>🛡</span>
+                        <span style={{ fontSize: 12, color: C.moss }}>of which emergency fund</span>
+                      </td>
+                      <td className="tnum" style={{ textAlign: "right", padding: "7px 8px", color: C.moss }}>{fmt(startPoint.efBalance || 0)}</td>
+                      {checkpointRows.map((c) => (
+                        <td key={c.y} className="tnum" style={{ textAlign: "right", padding: "7px 8px", color: C.moss }}>{fmt(c.efBalance || 0)}</td>
+                      ))}
+                    </tr>
+                  )}
+                </React.Fragment>
+              ))}
+              {/* liabilities row */}
+              <tr style={{ borderBottom: `1px solid ${C.line}`, color: C.red }}>
+                <td style={{ padding: "7px 8px" }}>Liabilities</td>
+                <td className="tnum" style={{ textAlign: "right", padding: "7px 8px" }}>−{fmt(start?.liabilities || 0)}</td>
+                {checkpointRows.map((c) => (
+                  <td key={c.y} className="tnum" style={{ textAlign: "right", padding: "7px 8px" }}>−{fmt(c.liabilities)}</td>
+                ))}
+              </tr>
+              {/* net worth row */}
+              <tr style={{ borderTop: `2px solid ${C.ink}`, fontWeight: 700 }}>
+                <td className="serif" style={{ padding: "8px" }}>Net worth</td>
+                <td className="tnum" style={{ textAlign: "right", padding: "8px", color: C.forest }}>{fmt(startNW)}</td>
+                {checkpointRows.map((c) => (
+                  <td key={c.y} className="tnum" style={{ textAlign: "right", padding: "8px", color: C.forest }}>{fmt(c.nw)}</td>
+                ))}
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
+      {milestones.length > 0 && (
+        <Card title="Milestones along the way" accent={C.brass}>
+          {milestones.slice().sort((x, y) => x.monthIndex - y.monthIndex).map((m, i) => (
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+              <div style={{ width: 8, height: 8, borderRadius: "50%", background: C.brass, flexShrink: 0 }} />
+              <span style={{ flex: 1, fontSize: 14, color: C.ink }}>{m.label}</span>
+              <span className="serif" style={{ fontSize: 13, color: C.forest, fontWeight: 600 }}>{monthLabel(m.date)}</span>
+            </div>
+          ))}
+        </Card>
+      )}
+
+      <Card title="Assumptions & surplus routing">
+        <p style={{ color: C.muted, fontSize: 13, marginTop: 0, lineHeight: 1.6, marginBottom: 16 }}>
+          Your monthly surplus is routed through your <strong>Goals</strong> (emergency fund first, then by priority). Once every goal is funded, the leftover flows into the destination below. Per-asset growth rates live on the Net Worth tab.
+        </p>
+        <label style={{ display: "block", marginBottom: 18 }}>
+          <span style={{ fontSize: 14, color: C.ink }}>Where leftover surplus goes</span>
+          <select value={overflowId || ""} onChange={(e) => setA("overflowAssetId", e.target.value)}
+            style={{ display: "block", marginTop: 6, width: "100%", maxWidth: 280, padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.line}`, background: "#fff", font: "inherit", color: C.ink }}>
+            {assetNames.map((an) => <option key={an.id} value={an.id}>{an.name}</option>)}
+          </select>
+          <span style={{ fontSize: 12, color: C.muted, display: "block", marginTop: 4 }}>Defaults to your highest-growth account ({overflowName}).</span>
+        </label>
+        <AssumptionSlider label="Time horizon" field="horizonYears" value={horizonYears} min={5} max={40} step={1} suffix=" yrs" setA={setA} />
+        <AssumptionSlider label="Annual raise / income growth" field="incomeGrowth" value={a.incomeGrowth != null ? a.incomeGrowth : 3} min={0} max={8} step={0.5} suffix="%" setA={setA} />
+        <AssumptionSlider label="Inflation / expense growth" field="expenseGrowth" value={a.expenseGrowth != null ? a.expenseGrowth : 3} min={0} max={8} step={0.5} suffix="%" setA={setA} />
+        <p style={{ fontSize: 12, color: C.muted, marginTop: 4, marginBottom: 0, lineHeight: 1.5 }}>
+          The emergency fund target grows with your expenses (it's a number of months of spending), so it tops up over time. Cash goals are spent when reached — you'll see net worth dip at those moments. A simplified model with constant rates; treat it as directional, not a guarantee.
         </p>
       </Card>
     </>
+  );
+}
+
+// Stacked area chart: one band per asset (assets only; liabilities shown as a line)
+function StackedAreaChart({ series, horizonYears, assetNames, colors, milestones }) {
+  if (!series || series.length < 2) return null;
+  const W = 680, H = 300, pL = 70, pR = 16, pT = 16, pB = 36;
+  const n = series.length;
+  // max stacked asset total
+  const maxStack = Math.max(...series.map((s) => s.assets), 1);
+  const cx = (i) => pL + (i / (n - 1)) * (W - pL - pR);
+  const cy = (v) => pT + (1 - v / maxStack) * (H - pT - pB);
+
+  // Build cumulative band paths (bottom-up)
+  const order = assetNames.map((an) => an.id);
+  const bands = order.map((id, bandIdx) => {
+    const topPts = [], botPts = [];
+    for (let i = 0; i < n; i++) {
+      const ba = series[i].byAsset;
+      let below = 0;
+      for (let k = 0; k < bandIdx; k++) { const f = ba.find((x) => x.id === order[k]); below += f ? f.value : 0; }
+      const meEntry = ba.find((x) => x.id === id);
+      const me = meEntry ? meEntry.value : 0;
+      topPts.push([cx(i), cy(below + me)]);
+      botPts.push([cx(i), cy(below)]);
+    }
+    const top = topPts.map((p, i) => `${i === 0 ? "M" : "L"} ${p[0]} ${p[1]}`).join(" ");
+    const bot = botPts.slice().reverse().map((p) => `L ${p[0]} ${p[1]}`).join(" ");
+    return { d: `${top} ${bot} Z`, color: colors[bandIdx % colors.length] };
+  });
+
+  const gridVals = [0, maxStack / 2, maxStack];
+  const yearTicks = [];
+  for (let y = 0; y <= horizonYears; y += Math.max(1, Math.ceil(horizonYears / 6))) yearTicks.push(y);
+
+  return (
+    <div style={{ width: "100%", overflowX: "auto" }}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", minWidth: 320, display: "block" }}>
+        {gridVals.map((gv, i) => (
+          <g key={i}>
+            <line x1={pL} y1={cy(gv)} x2={W - pR} y2={cy(gv)} stroke={C.line} strokeWidth="1" />
+            <text x={pL - 6} y={cy(gv) + 4} textAnchor="end" fontSize="10" fill={C.muted} fontFamily="Georgia, serif">{fmt(gv)}</text>
+          </g>
+        ))}
+        {yearTicks.map((y) => {
+          const i = Math.min(n - 1, y * 12);
+          return <text key={y} x={cx(i)} y={H - pB + 16} textAnchor="middle" fontSize="10" fill={C.muted} fontFamily="Georgia, serif">{y === 0 ? "now" : `${y}y`}</text>;
+        })}
+        {bands.map((b, i) => <path key={i} d={b.d} fill={b.color} fillOpacity="0.85" stroke="#fff" strokeWidth="0.5" />)}
+        {milestones.map((m, i) => {
+          const x = cx(Math.min(n - 1, m.monthIndex));
+          return <line key={i} x1={x} y1={pT} x2={x} y2={H - pB} stroke={C.ink} strokeWidth="1" strokeDasharray="2 3" opacity="0.35" />;
+        })}
+      </svg>
+    </div>
+  );
+}
+
+// Horizontal bar showing starting / contributions / growth proportions
+function ContribGrowthBar({ start, contrib, growth }) {
+  const total = Math.max(start + contrib + growth, 1);
+  const seg = (v, color, label) => (
+    v > 0 ? <div title={`${label}: ${fmt(v)}`} style={{ width: `${(v / total) * 100}%`, background: color, height: "100%" }} /> : null
+  );
+  return (
+    <div style={{ display: "flex", height: 18, borderRadius: 9, overflow: "hidden", background: C.paper }}>
+      {seg(start, C.muted, "Starting assets")}
+      {seg(contrib, C.moss, "You contributed")}
+      {seg(growth, C.brass, "Market growth")}
+    </div>
   );
 }
 
@@ -1156,6 +2179,9 @@ function MiniStat({ label, value, color }) {
     </div>
   );
 }
+
+function ProjectionChartRemoved() { return null; }
+
 
 
 ReactDOM.createRoot(document.getElementById("root")).render(<FinanceTracker />);
